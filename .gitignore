@@ -8,3 +8,5 @@ __pycache__
 MUJOCO_LOG.TXT
 hydrax/recordings/
 .idea
+.direnv
+.nix-override-bin
