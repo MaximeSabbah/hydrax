@@ -28,6 +28,7 @@
           devShells.default = pkgs.mkShell {
             packages = [
               pkgs.cudaPackages.cudatoolkit
+              pkgs.uv
               self'.packages.vscode
             ];
             # This contain coreutils and a 'id' binary not configured for LDAP,

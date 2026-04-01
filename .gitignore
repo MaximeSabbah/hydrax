@@ -10,3 +10,4 @@ hydrax/recordings/
 .idea
 .direnv
 .nix-override-bin
+.venv
