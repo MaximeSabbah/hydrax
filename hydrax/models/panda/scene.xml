@@ -45,7 +45,7 @@
     </body>
 
     <!-- Target placement position (mocap, user-draggable) -->
-    <body mocap="true" name="target" pos="0.5 0.3 0.025">
+    <body mocap="true" name="target" pos="0.5 0.3 0.15">
       <geom type="box" size="0.02 0.02 0.025" rgba="1 0.2 0.2 0.3"
        contype="0" conaffinity="0"/>
     </body>
