@@ -1,3 +1,4 @@
+from enum import IntEnum
 from typing import Dict
 
 import jax
@@ -9,6 +10,12 @@ from hydrax import ROOT
 from hydrax.task_base import Task
 
 
+class Phase(IntEnum):
+    PREGRASP = 0
+    GRASP = 1
+    PLACE = 2
+
+
 class PickAndPlace(Task):
     """Pick-and-place task with the Franka Emika Panda.
 
@@ -17,7 +24,6 @@ class PickAndPlace(Task):
     """
 
     def __init__(self, impl: str = "jax") -> None:
-        """Load the MuJoCo model and set task parameters."""
         mj_model = mujoco.MjModel.from_xml_path(
             ROOT + "/models/panda/scene.xml"
         )
@@ -44,79 +50,141 @@ class PickAndPlace(Task):
         # Gripper fully-open value
         self.gripper_open = 0.04
 
-        # Proximity kernel width for gripper cost (meters)
-        self.sigma = 0.03
+        # Home joint configuration
+        self.q_home = jnp.array([0.0, 0.3, 0.0, -1.57079, 0.0, 2.0, -0.7853])
 
-        # Home joint configuration (for regularization)
-        self.q_home = jnp.array([0, 0.3, 0, -1.57079, 0, 2.0, -0.7853])
+        # Hierarchical behavior settings
+        self.phase = Phase.PREGRASP
+        self.pregrasp_offset = jnp.array([0.0, 0.0, 0.05])  # 5 cm above object
+        self.pregrasp_tol = 0.03
+        self.grasp_tol = 0.03
+        self.phase_hold_steps = 3
+        self._phase_counter = 0
+
+    def reset_phase(self) -> None:
+        """Reset the task phase at episode start."""
+        self.phase = Phase.PREGRASP
+        self._phase_counter = 0
 
     def _get_ee_pos(self, state: mjx.Data) -> jax.Array:
-        """End-effector position in world frame."""
         return state.sensordata[self.ee_pos_adr : self.ee_pos_adr + 3]
 
     def _get_obj_pos(self, state: mjx.Data) -> jax.Array:
-        """Object position in world frame."""
         return state.sensordata[self.obj_pos_adr : self.obj_pos_adr + 3]
 
     def _get_target_pos(self, state: mjx.Data) -> jax.Array:
-        """Target position in world frame."""
-        return state.sensordata[
-            self.target_pos_adr : self.target_pos_adr + 3
-        ]
+        return state.sensordata[self.target_pos_adr : self.target_pos_adr + 3]
+
+    def update_phase(self, state: mjx.Data, control: jax.Array) -> None:
+        """Update the phase using the executed trajectory only.
+
+        Call this from the outer MPC loop on the real state, not inside
+        batched rollouts.
+        """
+        ee_pos = self._get_ee_pos(state)
+        obj_pos = self._get_obj_pos(state)
+        target_pos = self._get_target_pos(state)
+
+        dist_ee_obj = jnp.linalg.norm(ee_pos - obj_pos)
+        pregrasp_pos = obj_pos + self.pregrasp_offset
+        dist_ee_pregrasp = jnp.linalg.norm(ee_pos - pregrasp_pos)
+        obj_to_target = jnp.linalg.norm(obj_pos - target_pos)
+
+        gripper_closed = control[self.gripper_idx] < 0.5 * self.gripper_open
+        lifted_or_carrying = jnp.abs(obj_pos[2] - ee_pos[2]) < 0.05
+
+        if self.phase == Phase.PREGRASP:
+            if dist_ee_pregrasp < self.pregrasp_tol:
+                self._phase_counter += 1
+            else:
+                self._phase_counter = 0
+
+            if self._phase_counter >= self.phase_hold_steps:
+                self.phase = Phase.GRASP
+                self._phase_counter = 0
+
+        elif self.phase == Phase.GRASP:
+            # Move to PLACE once the hand is close, closed, and the object
+            # appears to follow the gripper.
+            if dist_ee_obj < self.grasp_tol and gripper_closed and lifted_or_carrying:
+                self._phase_counter += 1
+            else:
+                self._phase_counter = 0
+
+            if self._phase_counter >= self.phase_hold_steps:
+                self.phase = Phase.PLACE
+                self._phase_counter = 0
+
+        elif self.phase == Phase.PLACE:
+            # Stay in PLACE until task completion.
+            # You can add a DONE phase later if needed.
+            pass
 
     def running_cost(self, state: mjx.Data, control: jax.Array) -> jax.Array:
-        """The running cost l(x_t, u_t).
-
-        Combines reaching, transport, gripper, velocity, and posture costs
-        for stable MPPI-based pick-and-place.
-        """
         ee_pos = self._get_ee_pos(state)
         obj_pos = self._get_obj_pos(state)
         target_pos = self._get_target_pos(state)
 
-        # 1. Reach: drive end-effector toward the object
-        reach_err = ee_pos - obj_pos
-        reach_cost = jnp.sum(jnp.square(reach_err))
-
-        # 2. Transport: drive the object toward the target
-        obj_err = obj_pos - target_pos
-        obj_cost = jnp.sum(jnp.square(obj_err))
-
-        # 3. Gripper: proximity-based open/close
-        #    Close (0) when EE is near the object, open (0.04) when far
-        proximity = jnp.exp(
-            -jnp.sum(jnp.square(reach_err)) / (2.0 * self.sigma**2)
-        )
-        desired_gripper = self.gripper_open * (1.0 - proximity)
-        gripper_cost = jnp.square(control[self.gripper_idx] - desired_gripper)
-
-        # 4. Joint velocity damping (prevents aggressive motions)
         vel_cost = jnp.sum(jnp.square(state.qvel[:7]))
+        posture_cost = jnp.sum(jnp.square(state.qpos[:7] - self.q_home))
 
-        # 5. Posture regularization (stay near home when not needed)
-        posture_cost = jnp.sum(jnp.square(control[:7] - self.q_home))
+        if self.phase == Phase.PREGRASP:
+            pregrasp_pos = obj_pos + self.pregrasp_offset
+            pos_cost = jnp.sum(jnp.square(ee_pos - pregrasp_pos))
 
-        return (
-            5.0 * reach_cost
-            + 10.0 * obj_cost
-            + 2.0 * gripper_cost
-            + 0.01 * vel_cost
-            + 0.001 * posture_cost
-        )
+            # Keep the gripper open during approach.
+            gripper_cost = jnp.square(control[self.gripper_idx] - self.gripper_open)
+
+            total_cost = (
+                10.0 * pos_cost
+                + 2.0 * gripper_cost
+                + 0.002 * vel_cost
+                + 0.001 * posture_cost
+            )
+
+        elif self.phase == Phase.GRASP:
+            reach_cost = jnp.sum(jnp.square(ee_pos - obj_pos))
+
+            # Strongly encourage closing once close to the object.
+            desired_gripper = 0.0
+            gripper_cost = jnp.square(control[self.gripper_idx] - desired_gripper)
+
+            total_cost = (
+                8.0 * reach_cost
+                + 8.0 * gripper_cost
+                + 0.002 * vel_cost
+                + 0.001 * posture_cost
+            )
+
+        else:  # Phase.PLACE
+            place_cost = jnp.sum(jnp.square(obj_pos - target_pos))
+
+            # Encourage opening after transport.
+            gripper_cost = jnp.square(control[self.gripper_idx] - self.gripper_open)
+
+            # Optional: discourage the robot from staying glued to the object.
+            ee_away_cost = jnp.sum(jnp.square(ee_pos - target_pos))
+
+            total_cost = (
+                15.0 * place_cost
+                + 1.0 * gripper_cost
+                + 0.5 * ee_away_cost
+                + 0.002 * vel_cost
+                + 0.001 * posture_cost
+            )
+
+        return total_cost
 
     def terminal_cost(self, state: mjx.Data) -> jax.Array:
-        """The terminal cost phi(x_T).
-
-        Strongly penalizes object being far from target at end of horizon.
-        """
         obj_pos = self._get_obj_pos(state)
         target_pos = self._get_target_pos(state)
-        ee_pos = self._get_ee_pos(state)
-        reach_err = ee_pos - obj_pos
-        return 50.0 * jnp.sum(jnp.square(obj_pos - target_pos)) + 10.0 * jnp.sum(jnp.square(reach_err))
+
+        obj_cost = jnp.sum(jnp.square(obj_pos - target_pos))
+        vel_cost = jnp.sum(jnp.square(state.qvel[:7]))
+
+        return 100.0 * obj_cost + 0.05 * vel_cost
 
     def domain_randomize_model(self, rng: jax.Array) -> Dict[str, jax.Array]:
-        """Randomize friction for robustness to grasp uncertainty."""
         n_geoms = self.model.geom_friction.shape[0]
         multiplier = jax.random.uniform(
             rng, (n_geoms,), minval=0.5, maxval=2.0
@@ -129,12 +197,10 @@ class PickAndPlace(Task):
     def domain_randomize_data(
         self, data: mjx.Data, rng: jax.Array
     ) -> Dict[str, jax.Array]:
-        """Add small noise to the state estimate."""
         rng, q_rng, v_rng = jax.random.split(rng, 3)
         q_err = 0.005 * jax.random.normal(q_rng, (self.model.nq,))
         v_err = 0.005 * jax.random.normal(v_rng, (self.model.nv,))
         return {"qpos": data.qpos + q_err, "qvel": data.qvel + v_err}
 
     def make_data(self) -> mjx.Data:
-        """Create state with enough contact slots for grasping."""
         return super().make_data(nconmax=8000)
