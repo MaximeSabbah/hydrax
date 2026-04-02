@@ -1,9 +1,10 @@
 from enum import IntEnum
-from typing import Dict
+from typing import Tuple
 
 import jax
 import jax.numpy as jnp
 import mujoco
+import numpy as np
 from mujoco import mjx
 
 from hydrax import ROOT
@@ -11,309 +12,241 @@ from hydrax.task_base import Task
 
 
 class Phase(IntEnum):
-    """Pick-and-place sequencing phases."""
+    """Compatibility enum for the single reaching phase."""
 
-    PREGRASP = 0
-    DESCEND = 1
-    GRASP = 2
-    LIFT = 3
-    TRANSPORT = 4
-    PLACE = 5
-    OPEN = 6
-    RETREAT = 7
-    DONE = 8
+    REACH = 0
 
 
-# Desired EE z-axis: straight down [0, 0, -1]
+_DESIRED_X = jnp.array([1.0, 0.0, 0.0])
 _DESIRED_Z = jnp.array([0.0, 0.0, -1.0])
 
 
 class PickAndPlace(Task):
-    """Pick-and-place with the Franka Emika Panda.
+    """Reach a top-down pregrasp pose above the cube with the Panda arm."""
 
-    Uses a phase-based state machine inspired by STORM pick-and-place.
-    Each phase produces a different cost function.  Phase lives as a
-    plain Python int so the cost seen by JAX is a *static* function per
-    phase; all phases are pre-JIT-compiled at startup.
-    """
-
-    # ---- geometry / tolerance knobs (metres) ----------------------------
-    PREGRASP_HEIGHT = 0.10
-    DESCEND_HEIGHT = 0.005
-    LIFT_HEIGHT = 0.15
-    RETREAT_HEIGHT = 0.10
-    POS_TOL = 0.05
-    HOLD_STEPS = 3
+    GOAL_CLEARANCE = 0.05
+    MIN_CLEARANCE = 0.02
+    SUCCESS_POS_TOL = 0.02
+    SUCCESS_ORI_TOL = 0.08
 
     def __init__(self, impl: str = "jax") -> None:
+        """Load the Panda model and configure the reaching objective."""
         mj_model = mujoco.MjModel.from_xml_path(
             ROOT + "/models/panda/scene.xml"
         )
         super().__init__(mj_model, trace_sites=["gripper"], impl=impl)
 
-        # sensor addresses
-        self.ee_pos_adr = mj_model.sensor_adr[
-            mj_model.sensor("ee_pos").id
-        ]
-        self.ee_zaxis_adr = mj_model.sensor_adr[
-            mj_model.sensor("ee_zaxis").id
-        ]
-        self.obj_pos_adr = mj_model.sensor_adr[
-            mj_model.sensor("obj_pos").id
-        ]
-        self.target_pos_adr = mj_model.sensor_adr[
-            mj_model.sensor("target_pos").id
-        ]
+        self.ee_pos_adr = mj_model.sensor_adr[mj_model.sensor("ee_pos").id]
+        self.ee_xaxis_adr = mj_model.sensor_adr[mj_model.sensor("ee_xaxis").id]
+        self.ee_zaxis_adr = mj_model.sensor_adr[mj_model.sensor("ee_zaxis").id]
+        self.obj_pos_adr = mj_model.sensor_adr[mj_model.sensor("obj_pos").id]
+
+        self.object_body_idx = mj_model.body("object").id
+        self.object_geom_idx = mj_model.geom("object_geom").id
+        self.gripper_site_idx = mj_model.site("gripper").id
 
         self.gripper_idx = 7
         self.gripper_open = 0.04
-        self.gripper_close = 0.0
 
-        # mutable phase state (updated from the outer sim loop)
-        self.phase: Phase = Phase.PREGRASP
-        self._hold_count = 0
+        self.home_ctrl = jnp.array(mj_model.key_ctrl[0])
+        self.home_qpos = jnp.array(mj_model.key_qpos[0, :7])
+        self.object_half_height = float(
+            mj_model.geom_size[self.object_geom_idx, 2]
+        )
+        self.goal_offset = jnp.array(
+            [0.0, 0.0, self.object_half_height + self.GOAL_CLEARANCE]
+        )
+        self.goal_qpos = jnp.array(self._solve_nominal_goal_qpos())
+        self.goal_ctrl = jnp.array(self._solve_nominal_goal_ctrl())
 
-    # ---- sensor helpers -------------------------------------------------
+        self.phase = Phase.REACH
 
-    def _ee(self, s: mjx.Data) -> jax.Array:
-        return s.sensordata[self.ee_pos_adr : self.ee_pos_adr + 3]
+    def _solve_nominal_goal_qpos(self) -> np.ndarray:
+        """Solve a nominal IK pose for the default reaching target."""
+        mj_data = mujoco.MjData(self.mj_model)
+        mujoco.mj_resetDataKeyframe(self.mj_model, mj_data, 0)
+        mujoco.mj_forward(self.mj_model, mj_data)
 
-    def _ee_zaxis(self, s: mjx.Data) -> jax.Array:
-        """Z-axis of the gripper frame (approach direction)."""
-        return s.sensordata[self.ee_zaxis_adr : self.ee_zaxis_adr + 3]
+        goal_pos = (
+            mj_data.xpos[self.object_body_idx].copy()
+            + np.asarray(self.goal_offset)
+        )
+        goal_rot = np.diag([1.0, -1.0, -1.0])
+        jacp = np.zeros((3, self.mj_model.nv))
+        jacr = np.zeros((3, self.mj_model.nv))
 
-    def _obj(self, s: mjx.Data) -> jax.Array:
-        return s.sensordata[self.obj_pos_adr : self.obj_pos_adr + 3]
+        for _ in range(64):
+            mujoco.mj_forward(self.mj_model, mj_data)
+            site_rot = mj_data.site_xmat[self.gripper_site_idx].reshape(3, 3)
+            pos_err = goal_pos - mj_data.site_xpos[self.gripper_site_idx]
+            ori_err = 0.5 * (
+                np.cross(site_rot[:, 0], goal_rot[:, 0])
+                + np.cross(site_rot[:, 1], goal_rot[:, 1])
+                + np.cross(site_rot[:, 2], goal_rot[:, 2])
+            )
 
-    def _tgt(self, s: mjx.Data) -> jax.Array:
-        return s.sensordata[self.target_pos_adr : self.target_pos_adr + 3]
+            if (
+                np.linalg.norm(pos_err) < 1e-5
+                and np.linalg.norm(ori_err) < 1e-5
+            ):
+                break
+
+            mujoco.mj_jacSite(
+                self.mj_model, mj_data, jacp, jacr, self.gripper_site_idx
+            )
+            jacobian = np.vstack([jacp[:, :7], jacr[:, :7]])
+            err = np.concatenate([pos_err, ori_err])
+            damp = 1e-3
+            dq = jacobian.T @ np.linalg.solve(
+                jacobian @ jacobian.T + damp * np.eye(6), err
+            )
+            dq = np.clip(dq, -0.05, 0.05)
+            mj_data.qpos[:7] += dq
+            mj_data.qpos[:7] = np.clip(
+                mj_data.qpos[:7],
+                self.mj_model.jnt_range[:7, 0],
+                self.mj_model.jnt_range[:7, 1],
+            )
+
+        return mj_data.qpos[:7].copy()
+
+    def _solve_nominal_goal_ctrl(self) -> np.ndarray:
+        """Compensate for actuator steady-state error at the IK target."""
+        ctrl = np.concatenate(
+            [np.asarray(self.goal_qpos), np.array([self.gripper_open])]
+        )
+
+        for _ in range(6):
+            mj_data = mujoco.MjData(self.mj_model)
+            mujoco.mj_resetDataKeyframe(self.mj_model, mj_data, 0)
+
+            for _ in range(500):
+                mj_data.ctrl[:] = ctrl
+                mujoco.mj_step(self.mj_model, mj_data)
+
+            joint_err = np.asarray(self.goal_qpos) - mj_data.qpos[:7]
+            if np.linalg.norm(joint_err) < 1e-5:
+                break
+
+            ctrl[:7] += joint_err
+            ctrl = np.clip(
+                ctrl,
+                self.mj_model.actuator_ctrlrange[:, 0],
+                self.mj_model.actuator_ctrlrange[:, 1],
+            )
+
+        ctrl[self.gripper_idx] = self.gripper_open
+        return ctrl
+
+    def _ee(self, state: mjx.Data) -> jax.Array:
+        return state.sensordata[self.ee_pos_adr : self.ee_pos_adr + 3]
+
+    def _ee_xaxis(self, state: mjx.Data) -> jax.Array:
+        return state.sensordata[self.ee_xaxis_adr : self.ee_xaxis_adr + 3]
+
+    def _ee_zaxis(self, state: mjx.Data) -> jax.Array:
+        return state.sensordata[self.ee_zaxis_adr : self.ee_zaxis_adr + 3]
+
+    def _obj(self, state: mjx.Data) -> jax.Array:
+        return state.sensordata[self.obj_pos_adr : self.obj_pos_adr + 3]
+
+    def goal_position(self, state: mjx.Data) -> jax.Array:
+        """Target point 5 cm above the cube's top face."""
+        return self._obj(state) + self.goal_offset
+
+    def goal_position_from_data(self, mj_data: mujoco.MjData) -> jax.Array:
+        """Goal position helper for the Python simulation loop."""
+        return jnp.array(mj_data.xpos[self.object_body_idx]) + self.goal_offset
 
     def reset_phase(self) -> None:
-        """Reset to initial phase."""
-        self.phase = Phase.PREGRASP
-        self._hold_count = 0
-
-    # ---- phase machine (called from the sim loop on real state) ---------
+        """Compatibility shim for the old example API."""
+        self.phase = Phase.REACH
 
     def update_phase(self, mj_data: mujoco.MjData) -> bool:
-        """Advance the state machine.  Returns True when the phase changed."""
-        ee = mj_data.site_xpos[self.mj_model.site("gripper").id]
-        obj = mj_data.xpos[self.mj_model.body("object").id]
-        tgt = mj_data.mocap_pos[0]
+        """Compatibility shim for the old example API."""
+        del mj_data
+        return False
 
-        old = self.phase
+    def _pose_error(self, state: mjx.Data) -> jax.Array:
+        return self.goal_position(state) - self._ee(state)
 
-        if self.phase == Phase.PREGRASP:
-            goal = obj + [0, 0, self.PREGRASP_HEIGHT]
-            self._tick(float(jnp.linalg.norm(jnp.array(ee - goal))))
-            if self._hold_count >= self.HOLD_STEPS:
-                self.phase = Phase.DESCEND
-
-        elif self.phase == Phase.DESCEND:
-            goal = obj + [0, 0, self.DESCEND_HEIGHT]
-            self._tick(float(jnp.linalg.norm(jnp.array(ee - goal))))
-            if self._hold_count >= self.HOLD_STEPS:
-                self.phase = Phase.GRASP
-
-        elif self.phase == Phase.GRASP:
-            self._hold_count += 1
-            if self._hold_count >= self.HOLD_STEPS * 3:
-                self.phase = Phase.LIFT
-
-        elif self.phase == Phase.LIFT:
-            goal = obj + [0, 0, self.LIFT_HEIGHT]
-            self._tick(float(jnp.linalg.norm(jnp.array(ee - goal))))
-            if self._hold_count >= self.HOLD_STEPS:
-                self.phase = Phase.TRANSPORT
-
-        elif self.phase == Phase.TRANSPORT:
-            goal = tgt + [0, 0, self.LIFT_HEIGHT]
-            self._tick(float(jnp.linalg.norm(jnp.array(ee - goal))))
-            if self._hold_count >= self.HOLD_STEPS:
-                self.phase = Phase.PLACE
-
-        elif self.phase == Phase.PLACE:
-            self._tick(float(jnp.linalg.norm(jnp.array(ee - tgt))))
-            if self._hold_count >= self.HOLD_STEPS:
-                self.phase = Phase.OPEN
-
-        elif self.phase == Phase.OPEN:
-            self._hold_count += 1
-            if self._hold_count >= self.HOLD_STEPS * 3:
-                self.phase = Phase.RETREAT
-
-        elif self.phase == Phase.RETREAT:
-            goal = tgt + [0, 0, self.RETREAT_HEIGHT]
-            self._tick(float(jnp.linalg.norm(jnp.array(ee - goal))))
-            if self._hold_count >= self.HOLD_STEPS:
-                self.phase = Phase.DONE
-
-        changed = self.phase != old
-        if changed:
-            self._hold_count = 0
-            print(f"\n>>> Phase: {Phase(old).name} -> {self.phase.name}")
-        return changed
-
-    def _tick(self, err: float) -> None:
-        if err < self.POS_TOL:
-            self._hold_count += 1
-        else:
-            self._hold_count = 0
-
-    # ---- cost building blocks (STORM-aligned) ----------------------------
-
-    def _pos_cost(self, ee: jax.Array, goal: jax.Array) -> jax.Array:
-        """Position cost: L2 norm (not squared).
-
-        STORM uses 200 * ||pos_err||.  The norm gives constant gradient
-        magnitude regardless of distance, which drives convergence from
-        far away much better than squared error.
-        """
-        return jnp.sqrt(jnp.sum(jnp.square(ee - goal)) + 1e-8)
-
-    def _ori_cost(self, state: mjx.Data) -> jax.Array:
-        """Orientation cost: L2 norm of z-axis deviation.
-
-        Penalizes deviation of EE z-axis from straight-down [0,0,-1].
-        Uses norm (not squared) to match STORM's approach.
-        """
-        z_ee = self._ee_zaxis(state)
-        return jnp.sqrt(jnp.sum(jnp.square(z_ee - _DESIRED_Z)) + 1e-8)
-
-    def _gripper_cost(self, ctrl: jax.Array, desired: float) -> jax.Array:
-        return jnp.square(ctrl[self.gripper_idx] - desired)
-
-    def _vel_cost(self, s: mjx.Data) -> jax.Array:
-        return jnp.sum(jnp.square(s.qvel[:7]))
-
-    # ---- unified move cost ----------------------------------------------
-
-    def _move_cost(
-        self,
-        state: mjx.Data,
-        control: jax.Array,
-        goal: jax.Array,
-        gripper_target: float,
-        pos_w: float = 200.0,
-        grip_w: float = 2.0,
-        ori_w: float = 100.0,
+    def _axis_alignment_cost(
+        self, axis: jax.Array, target_axis: jax.Array
     ) -> jax.Array:
-        """Unified move-to-goal cost used by most phases.
+        return 1.0 - jnp.clip(jnp.dot(axis, target_axis), -1.0, 1.0)
 
-        Weights aligned with STORM: pos=200, ori=100.
-        Running velocity penalty is kept very low — the robot should be
-        free to move fast.  Deceleration is handled by the terminal cost.
-        """
-        ee = self._ee(state)
-        return (
-            pos_w * self._pos_cost(ee, goal)
-            + ori_w * self._ori_cost(state)
-            + grip_w * self._gripper_cost(control, gripper_target)
-            + 0.1 * self._vel_cost(state)
-        )
+    def _orientation_cost(self, state: mjx.Data) -> jax.Array:
+        z_cost = self._axis_alignment_cost(self._ee_zaxis(state), _DESIRED_Z)
+        x_cost = self._axis_alignment_cost(self._ee_xaxis(state), _DESIRED_X)
+        return z_cost + 0.5 * x_cost
 
-    # ---- phase-specific costs -------------------------------------------
+    def _position_cost(self, state: mjx.Data) -> jax.Array:
+        pos_err = self._pose_error(state)
+        xy_err = jnp.sqrt(jnp.sum(jnp.square(pos_err[:2])) + 1e-8)
+        z_err = jnp.abs(pos_err[2])
+        return 80.0 * xy_err + 50.0 * z_err
+
+    def _clearance_cost(self, state: mjx.Data) -> jax.Array:
+        cube_top = self._obj(state)[2] + self.object_half_height
+        ee_height = self._ee(state)[2]
+        violation = jax.nn.relu(cube_top + self.MIN_CLEARANCE - ee_height)
+        return jnp.square(violation)
+
+    def _velocity_cost(self, state: mjx.Data) -> jax.Array:
+        return jnp.sum(jnp.square(state.qvel[:8]))
+
+    def _joint_state_cost(self, state: mjx.Data) -> jax.Array:
+        return jnp.sum(jnp.square(state.qpos[:7] - self.goal_qpos))
+
+    def _joint_control_cost(self, control: jax.Array) -> jax.Array:
+        return jnp.sum(jnp.square(control[:7] - self.goal_ctrl[:7]))
+
+    def _gripper_cost(self, control: jax.Array) -> jax.Array:
+        return jnp.square(control[self.gripper_idx] - self.gripper_open)
 
     def running_cost(self, state: mjx.Data, control: jax.Array) -> jax.Array:
-        """Running cost — branches on the current (static) phase."""
-        obj = self._obj(state)
-        tgt = self._tgt(state)
-
-        if self.phase == Phase.PREGRASP:
-            goal = obj + jnp.array([0.0, 0.0, self.PREGRASP_HEIGHT])
-            return self._move_cost(state, control, goal, self.gripper_open)
-
-        if self.phase == Phase.DESCEND:
-            goal = obj + jnp.array([0.0, 0.0, self.DESCEND_HEIGHT])
-            return self._move_cost(state, control, goal, self.gripper_open)
-
-        if self.phase == Phase.GRASP:
-            return self._move_cost(
-                state, control, obj, self.gripper_close,
-                pos_w=150.0, grip_w=50.0,
-            )
-
-        if self.phase == Phase.LIFT:
-            goal = obj + jnp.array([0.0, 0.0, self.LIFT_HEIGHT])
-            return self._move_cost(
-                state, control, goal, self.gripper_close, grip_w=30.0,
-            )
-
-        if self.phase == Phase.TRANSPORT:
-            goal = tgt + jnp.array([0.0, 0.0, self.LIFT_HEIGHT])
-            return self._move_cost(
-                state, control, goal, self.gripper_close, grip_w=30.0,
-            )
-
-        if self.phase == Phase.PLACE:
-            return self._move_cost(
-                state, control, tgt, self.gripper_close, grip_w=30.0,
-            )
-
-        if self.phase == Phase.OPEN:
-            return self._move_cost(
-                state, control, tgt, self.gripper_open,
-                pos_w=100.0, grip_w=50.0,
-            )
-
-        if self.phase == Phase.RETREAT:
-            goal = tgt + jnp.array([0.0, 0.0, self.RETREAT_HEIGHT])
-            return self._move_cost(state, control, goal, self.gripper_open)
-
-        # DONE
-        return 0.1 * self._vel_cost(state)
+        """Running cost for stable top-down pose reaching."""
+        return (
+            self._position_cost(state)
+            + 60.0 * self._orientation_cost(state)
+            + 30.0 * self._joint_state_cost(state)
+            + 5.0 * self._joint_control_cost(control)
+            + 250.0 * self._clearance_cost(state)
+            + 2.0 * self._gripper_cost(control)
+            + 0.05 * self._velocity_cost(state)
+        )
 
     def terminal_cost(self, state: mjx.Data) -> jax.Array:
-        """Terminal cost: strong position + orientation + velocity penalty.
-
-        The velocity penalty at the terminal state acts like STORM's
-        deceleration envelope — it forces rollouts to plan trajectories
-        that are nearly stopped at the end of the horizon.
-        """
-        ee = self._ee(state)
-        obj = self._obj(state)
-        tgt = self._tgt(state)
-
-        if self.phase == Phase.PREGRASP:
-            goal = obj + jnp.array([0.0, 0.0, self.PREGRASP_HEIGHT])
-        elif self.phase == Phase.DESCEND:
-            goal = obj + jnp.array([0.0, 0.0, self.DESCEND_HEIGHT])
-        elif self.phase in (Phase.GRASP,):
-            goal = obj
-        elif self.phase == Phase.LIFT:
-            goal = obj + jnp.array([0.0, 0.0, self.LIFT_HEIGHT])
-        elif self.phase == Phase.TRANSPORT:
-            goal = tgt + jnp.array([0.0, 0.0, self.LIFT_HEIGHT])
-        elif self.phase in (Phase.PLACE, Phase.OPEN):
-            goal = tgt
-        elif self.phase == Phase.RETREAT:
-            goal = tgt + jnp.array([0.0, 0.0, self.RETREAT_HEIGHT])
-        else:
-            return jnp.array(0.0)
-
+        """Terminal cost sharpens final pose accuracy and settling."""
+        pos_err = self._pose_error(state)
         return (
-            200.0 * self._pos_cost(ee, goal)
-            + 100.0 * self._ori_cost(state)
-            + 20.0 * self._vel_cost(state)
+            900.0 * jnp.sum(jnp.square(pos_err))
+            + 180.0 * self._orientation_cost(state)
+            + 80.0 * self._joint_state_cost(state)
+            + 10.0 * self._velocity_cost(state)
         )
 
-    # ---- domain randomization & data ------------------------------------
+    def pose_error_from_data(
+        self, mj_data: mujoco.MjData
+    ) -> Tuple[float, float]:
+        """Return Euclidean position error and orientation cost."""
+        goal = self.goal_position_from_data(mj_data)
+        ee_pos = jnp.array(mj_data.site_xpos[self.gripper_site_idx])
+        xmat = jnp.array(mj_data.site_xmat[self.gripper_site_idx]).reshape(3, 3)
 
-    def domain_randomize_model(self, rng: jax.Array) -> Dict[str, jax.Array]:
-        n_geoms = self.model.geom_friction.shape[0]
-        mult = jax.random.uniform(rng, (n_geoms,), minval=0.5, maxval=2.0)
-        new_f = self.model.geom_friction.at[:, 0].set(
-            self.model.geom_friction[:, 0] * mult
+        pos_err = float(jnp.linalg.norm(goal - ee_pos))
+        z_cost = float(self._axis_alignment_cost(xmat[:, 2], _DESIRED_Z))
+        x_cost = float(self._axis_alignment_cost(xmat[:, 0], _DESIRED_X))
+        return pos_err, z_cost + 0.5 * x_cost
+
+    def goal_reached(self, mj_data: mujoco.MjData) -> bool:
+        """Check whether the end effector is at the target pose."""
+        pos_err, ori_err = self.pose_error_from_data(mj_data)
+        return (
+            pos_err <= self.SUCCESS_POS_TOL
+            and ori_err <= self.SUCCESS_ORI_TOL
         )
-        return {"geom_friction": new_f}
-
-    def domain_randomize_data(
-        self, data: mjx.Data, rng: jax.Array
-    ) -> Dict[str, jax.Array]:
-        rng, q_rng, v_rng = jax.random.split(rng, 3)
-        q_err = 0.005 * jax.random.normal(q_rng, (self.model.nq,))
-        v_err = 0.005 * jax.random.normal(v_rng, (self.model.nv,))
-        return {"qpos": data.qpos + q_err, "qvel": data.qvel + v_err}
 
     def make_data(self) -> mjx.Data:
+        """Allocate MJX data with enough contact capacity for the scene."""
         return super().make_data(nconmax=200)
