@@ -42,8 +42,8 @@ class PickAndPlace(Task):
     DESCEND_HEIGHT = 0.005
     LIFT_HEIGHT = 0.15
     RETREAT_HEIGHT = 0.10
-    POS_TOL = 0.025
-    HOLD_STEPS = 5
+    POS_TOL = 0.05
+    HOLD_STEPS = 3
 
     def __init__(self, impl: str = "jax") -> None:
         mj_model = mujoco.MjModel.from_xml_path(
@@ -160,40 +160,31 @@ class PickAndPlace(Task):
         else:
             self._hold_count = 0
 
-    # ---- cost building blocks -------------------------------------------
+    # ---- cost building blocks (STORM-aligned) ----------------------------
 
     def _pos_cost(self, ee: jax.Array, goal: jax.Array) -> jax.Array:
-        """Position cost with STORM-style convergence dead-zone.
+        """Position cost: L2 norm (not squared).
 
-        Quadratic beyond a threshold, zero inside.  Prevents the
-        optimizer from fighting over sub-centimetre errors that cause
-        oscillation.
+        STORM uses 200 * ||pos_err||.  The norm gives constant gradient
+        magnitude regardless of distance, which drives convergence from
+        far away much better than squared error.
         """
-        err_sq = jnp.sum(jnp.square(ee - goal))
-        deadzone = 0.01**2  # 1 cm dead-zone radius
-        return jnp.maximum(err_sq - deadzone, 0.0)
+        return jnp.sqrt(jnp.sum(jnp.square(ee - goal)) + 1e-8)
 
     def _ori_cost(self, state: mjx.Data) -> jax.Array:
-        """Penalize deviation of EE z-axis from straight-down [0,0,-1].
+        """Orientation cost: L2 norm of z-axis deviation.
 
-        Uses ||z_ee - z_desired||^2.  Max value = 4 (opposite direction).
+        Penalizes deviation of EE z-axis from straight-down [0,0,-1].
+        Uses norm (not squared) to match STORM's approach.
         """
         z_ee = self._ee_zaxis(state)
-        return jnp.sum(jnp.square(z_ee - _DESIRED_Z))
+        return jnp.sqrt(jnp.sum(jnp.square(z_ee - _DESIRED_Z)) + 1e-8)
 
     def _gripper_cost(self, ctrl: jax.Array, desired: float) -> jax.Array:
         return jnp.square(ctrl[self.gripper_idx] - desired)
 
     def _vel_cost(self, s: mjx.Data) -> jax.Array:
         return jnp.sum(jnp.square(s.qvel[:7]))
-
-    def _stop_cost(
-        self, s: mjx.Data, ee: jax.Array, goal: jax.Array
-    ) -> jax.Array:
-        """Penalize velocity more as EE nears goal (smooth convergence)."""
-        dist_sq = jnp.sum(jnp.square(ee - goal))
-        proximity = jnp.exp(-dist_sq / (2.0 * 0.03**2))
-        return proximity * jnp.sum(jnp.square(s.qvel[:7]))
 
     # ---- unified move cost ----------------------------------------------
 
@@ -203,18 +194,22 @@ class PickAndPlace(Task):
         control: jax.Array,
         goal: jax.Array,
         gripper_target: float,
-        pos_w: float = 30.0,
+        pos_w: float = 200.0,
         grip_w: float = 2.0,
-        ori_w: float = 25.0,
+        ori_w: float = 100.0,
     ) -> jax.Array:
-        """Unified move-to-goal cost used by most phases."""
+        """Unified move-to-goal cost used by most phases.
+
+        Weights aligned with STORM: pos=200, ori=100.
+        Running velocity penalty is kept very low — the robot should be
+        free to move fast.  Deceleration is handled by the terminal cost.
+        """
         ee = self._ee(state)
         return (
             pos_w * self._pos_cost(ee, goal)
             + ori_w * self._ori_cost(state)
             + grip_w * self._gripper_cost(control, gripper_target)
-            + 0.02 * self._vel_cost(state)
-            + 3.0 * self._stop_cost(state, ee, goal)
+            + 0.1 * self._vel_cost(state)
         )
 
     # ---- phase-specific costs -------------------------------------------
@@ -235,30 +230,30 @@ class PickAndPlace(Task):
         if self.phase == Phase.GRASP:
             return self._move_cost(
                 state, control, obj, self.gripper_close,
-                pos_w=20.0, grip_w=20.0,
+                pos_w=150.0, grip_w=50.0,
             )
 
         if self.phase == Phase.LIFT:
             goal = obj + jnp.array([0.0, 0.0, self.LIFT_HEIGHT])
             return self._move_cost(
-                state, control, goal, self.gripper_close, grip_w=10.0,
+                state, control, goal, self.gripper_close, grip_w=30.0,
             )
 
         if self.phase == Phase.TRANSPORT:
             goal = tgt + jnp.array([0.0, 0.0, self.LIFT_HEIGHT])
             return self._move_cost(
-                state, control, goal, self.gripper_close, grip_w=10.0,
+                state, control, goal, self.gripper_close, grip_w=30.0,
             )
 
         if self.phase == Phase.PLACE:
             return self._move_cost(
-                state, control, tgt, self.gripper_close, grip_w=10.0,
+                state, control, tgt, self.gripper_close, grip_w=30.0,
             )
 
         if self.phase == Phase.OPEN:
             return self._move_cost(
                 state, control, tgt, self.gripper_open,
-                pos_w=10.0, grip_w=20.0,
+                pos_w=100.0, grip_w=50.0,
             )
 
         if self.phase == Phase.RETREAT:
@@ -266,10 +261,15 @@ class PickAndPlace(Task):
             return self._move_cost(state, control, goal, self.gripper_open)
 
         # DONE
-        return 0.01 * self._vel_cost(state)
+        return 0.1 * self._vel_cost(state)
 
     def terminal_cost(self, state: mjx.Data) -> jax.Array:
-        """Terminal cost mirrors the running cost goal."""
+        """Terminal cost: strong position + orientation + velocity penalty.
+
+        The velocity penalty at the terminal state acts like STORM's
+        deceleration envelope — it forces rollouts to plan trajectories
+        that are nearly stopped at the end of the horizon.
+        """
         ee = self._ee(state)
         obj = self._obj(state)
         tgt = self._tgt(state)
@@ -292,8 +292,9 @@ class PickAndPlace(Task):
             return jnp.array(0.0)
 
         return (
-            50.0 * self._pos_cost(ee, goal)
-            + 10.0 * self._ori_cost(state)
+            200.0 * self._pos_cost(ee, goal)
+            + 100.0 * self._ori_cost(state)
+            + 20.0 * self._vel_cost(state)
         )
 
     # ---- domain randomization & data ------------------------------------

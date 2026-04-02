@@ -26,10 +26,10 @@ task = PickAndPlace()
 
 ctrl = MPPI(
     task,
-    num_samples=64,
-    noise_level=0.08,
-    temperature=0.3,
-    step_size=0.25,
+    num_samples=128,
+    noise_level=0.3,
+    temperature=10.0,
+    step_size=0.5,
     num_randomizations=1,
     plan_horizon=0.3,
     spline_type="zero",
@@ -70,10 +70,22 @@ TRACE_COLOR = [0.2, 0.8, 0.2, 0.15]
 
 # ── pre-JIT every phase at startup ───────────────────────────────────
 def jit_for_phase(phase, controller, warmup_data, warmup_knots):
-    """JIT-compile controller.optimize for one specific phase."""
+    """JIT-compile controller.optimize for one specific phase.
+
+    Each phase is wrapped in a unique closure so JAX traces independently
+    (same underlying method → same cache key → only first phase compiled).
+    """
     controller.task.phase = phase
-    jit_opt = jax.jit(controller.optimize)
-    jit_interp = jax.jit(controller.interp_func)
+
+    # Closures create unique function identities, forcing fresh JIT traces
+    def _optimize(state, params):
+        return controller.optimize(state, params)
+
+    def _interp(tq, tk, knots):
+        return controller.interp_func(tq, tk, knots)
+
+    jit_opt = jax.jit(_optimize)
+    jit_interp = jax.jit(_interp)
 
     # init + two warm-up calls to fully compile XLA
     params = controller.init_params(initial_knots=warmup_knots)
