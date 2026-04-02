@@ -12,11 +12,17 @@ from hydrax.task_base import Task
 
 
 class Phase(IntEnum):
-    """Minimal pregrasp-to-grasp sequence."""
+    """Minimal full pick-and-place sequence."""
 
     PREGRASP = 0
     DESCEND = 1
     CLOSE = 2
+    LIFT = 3
+    TRANSPORT = 4
+    PLACE = 5
+    OPEN = 6
+    RETREAT = 7
+    DONE = 8
 
 
 _DESIRED_X = jnp.array([1.0, 0.0, 0.0])
@@ -24,21 +30,34 @@ _DESIRED_Z = jnp.array([0.0, 0.0, -1.0])
 
 
 class PickAndPlace(Task):
-    """Reach above the cube, descend onto it, then close the gripper."""
+    """Pick up the cube, move it to the target, release, and retreat."""
 
     PREGRASP_CLEARANCE = 0.05
-    DESCEND_CLEARANCE = 0.0
+    CARRY_CLEARANCE = 0.12
+    RETREAT_CLEARANCE = 0.05
     MIN_CLEARANCE = 0.02
+
     PREGRASP_POS_TOL = 0.02
     DESCEND_POS_TOL = 0.01
+    CARRY_OBJ_TOL = 0.025
+    PLACE_OBJ_TOL = 0.02
+    RETREAT_POS_TOL = 0.03
     SUCCESS_ORI_TOL = 0.08
+
     PREGRASP_HOLD_STEPS = 4
     DESCEND_HOLD_STEPS = 1
     CLOSE_CONTACT_HOLD_STEPS = 4
+    LIFT_HOLD_STEPS = 2
+    TRANSPORT_HOLD_STEPS = 2
+    PLACE_HOLD_STEPS = 2
+    OPEN_HOLD_STEPS = 2
+    RETREAT_HOLD_STEPS = 2
+
     CLOSED_FINGER_WIDTH = 0.022
+    OPEN_FINGER_WIDTH = 0.035
 
     def __init__(self, impl: str = "jax") -> None:
-        """Load the Panda model and configure the three-phase sequence."""
+        """Load the Panda model and configure the placement sequence."""
         mj_model = mujoco.MjModel.from_xml_path(
             ROOT + "/models/panda/scene.xml"
         )
@@ -48,6 +67,9 @@ class PickAndPlace(Task):
         self.ee_xaxis_adr = mj_model.sensor_adr[mj_model.sensor("ee_xaxis").id]
         self.ee_zaxis_adr = mj_model.sensor_adr[mj_model.sensor("ee_zaxis").id]
         self.obj_pos_adr = mj_model.sensor_adr[mj_model.sensor("obj_pos").id]
+        self.target_pos_adr = mj_model.sensor_adr[
+            mj_model.sensor("target_pos").id
+        ]
 
         self.object_body_idx = mj_model.body("object").id
         self.object_geom_idx = mj_model.geom("object_geom").id
@@ -65,16 +87,61 @@ class PickAndPlace(Task):
         self.pregrasp_offset = jnp.array(
             [0.0, 0.0, self.object_half_height + self.PREGRASP_CLEARANCE]
         )
-        self.descend_offset = jnp.array([0.0, 0.0, self.DESCEND_CLEARANCE])
-
-        self.pregrasp_qpos = jnp.array(
-            self._solve_nominal_goal_qpos(self.pregrasp_offset)
+        self.carry_offset = jnp.array([0.0, 0.0, self.CARRY_CLEARANCE])
+        self.retreat_offset = jnp.array(
+            [0.0, 0.0, self.object_half_height + self.RETREAT_CLEARANCE]
         )
-        self.pregrasp_ctrl = jnp.array(
-            self._solve_nominal_goal_ctrl(self.pregrasp_qpos, self.gripper_open)
+        self._init_reference_targets()
+        self._init_nominal_controls()
+        self._init_phase_metadata()
+
+        self.phase = Phase.PREGRASP
+        self._hold_count = 0
+
+    def _init_reference_targets(self) -> None:
+        """Initialize the default object and target reference positions."""
+        ref_data = mujoco.MjData(self.mj_model)
+        mujoco.mj_resetDataKeyframe(self.mj_model, ref_data, 0)
+        mujoco.mj_forward(self.mj_model, ref_data)
+
+        self.initial_object_pos = jnp.array(
+            ref_data.xpos[self.object_body_idx].copy()
+        )
+        self.place_height = float(self.initial_object_pos[2])
+        ref_data.mocap_pos[0, 2] = self.place_height
+        mujoco.mj_forward(self.mj_model, ref_data)
+        self.default_target_pos = jnp.array(ref_data.mocap_pos[0].copy())
+
+        self.pregrasp_goal_pos = self.initial_object_pos + self.pregrasp_offset
+        self.descend_goal_pos = self.initial_object_pos
+        self.lift_goal_pos = self.initial_object_pos + self.carry_offset
+        self.transport_goal_pos = self.default_target_pos + self.carry_offset
+        self.place_goal_pos = self.default_target_pos
+        self.retreat_goal_pos = self.default_target_pos + self.retreat_offset
+
+    def _init_nominal_controls(self) -> None:
+        """Initialize nominal arm configurations and controls per phase."""
+        self.pregrasp_qpos = jnp.array(
+            self._solve_nominal_goal_qpos(self.pregrasp_goal_pos)
         )
         self.descend_qpos = jnp.array(
-            self._solve_nominal_goal_qpos(self.descend_offset)
+            self._solve_nominal_goal_qpos(self.descend_goal_pos)
+        )
+        self.lift_qpos = jnp.array(
+            self._solve_nominal_goal_qpos(self.lift_goal_pos)
+        )
+        self.transport_qpos = jnp.array(
+            self._solve_nominal_goal_qpos(self.transport_goal_pos)
+        )
+        self.place_qpos = jnp.array(
+            self._solve_nominal_goal_qpos(self.place_goal_pos)
+        )
+        self.retreat_qpos = jnp.array(
+            self._solve_nominal_goal_qpos(self.retreat_goal_pos)
+        )
+
+        self.pregrasp_ctrl = jnp.array(
+            self._solve_nominal_goal_ctrl(self.pregrasp_qpos, self.gripper_open)
         )
         self.descend_ctrl = jnp.array(
             self._solve_nominal_goal_ctrl(self.descend_qpos, self.gripper_open)
@@ -82,27 +149,120 @@ class PickAndPlace(Task):
         self.close_ctrl = self.descend_ctrl.at[self.gripper_idx].set(
             self.gripper_close
         )
+        self.lift_ctrl = jnp.array(
+            self._solve_nominal_goal_ctrl(self.lift_qpos, self.gripper_close)
+        )
+        self.transport_ctrl = jnp.array(
+            self._solve_nominal_goal_ctrl(
+                self.transport_qpos, self.gripper_close
+            )
+        )
+        self.place_ctrl = jnp.array(
+            self._solve_nominal_goal_ctrl(self.place_qpos, self.gripper_close)
+        )
+        self.open_ctrl = jnp.array(
+            self._solve_nominal_goal_ctrl(self.place_qpos, self.gripper_open)
+        )
+        self.retreat_ctrl = jnp.array(
+            self._solve_nominal_goal_ctrl(self.retreat_qpos, self.gripper_open)
+        )
 
-        self.phase = Phase.PREGRASP
-        self._hold_count = 0
+    def _init_phase_metadata(self) -> None:
+        """Initialize phase-indexed metadata tables."""
+        self.phase_goal_qpos_map = {
+            Phase.PREGRASP: self.pregrasp_qpos,
+            Phase.DESCEND: self.descend_qpos,
+            Phase.CLOSE: self.descend_qpos,
+            Phase.LIFT: self.lift_qpos,
+            Phase.TRANSPORT: self.transport_qpos,
+            Phase.PLACE: self.place_qpos,
+            Phase.OPEN: self.place_qpos,
+            Phase.RETREAT: self.retreat_qpos,
+            Phase.DONE: self.retreat_qpos,
+        }
+        self.phase_goal_ctrl_map = {
+            Phase.PREGRASP: self.pregrasp_ctrl,
+            Phase.DESCEND: self.descend_ctrl,
+            Phase.CLOSE: self.close_ctrl,
+            Phase.LIFT: self.lift_ctrl,
+            Phase.TRANSPORT: self.transport_ctrl,
+            Phase.PLACE: self.place_ctrl,
+            Phase.OPEN: self.open_ctrl,
+            Phase.RETREAT: self.retreat_ctrl,
+            Phase.DONE: self.retreat_ctrl,
+        }
+        self.phase_hold_steps_map = {
+            Phase.PREGRASP: self.PREGRASP_HOLD_STEPS,
+            Phase.DESCEND: self.DESCEND_HOLD_STEPS,
+            Phase.CLOSE: self.CLOSE_CONTACT_HOLD_STEPS,
+            Phase.LIFT: self.LIFT_HOLD_STEPS,
+            Phase.TRANSPORT: self.TRANSPORT_HOLD_STEPS,
+            Phase.PLACE: self.PLACE_HOLD_STEPS,
+            Phase.OPEN: self.OPEN_HOLD_STEPS,
+            Phase.RETREAT: self.RETREAT_HOLD_STEPS,
+            Phase.DONE: 0,
+        }
+        self.phase_next_map = {
+            Phase.PREGRASP: Phase.DESCEND,
+            Phase.DESCEND: Phase.CLOSE,
+            Phase.CLOSE: Phase.LIFT,
+            Phase.LIFT: Phase.TRANSPORT,
+            Phase.TRANSPORT: Phase.PLACE,
+            Phase.PLACE: Phase.OPEN,
+            Phase.OPEN: Phase.RETREAT,
+            Phase.RETREAT: Phase.DONE,
+            Phase.DONE: Phase.DONE,
+        }
+        self.phase_cost_weights_map = {
+            Phase.PREGRASP: (1.0, 0.0, 250.0),
+            Phase.DESCEND: (1.2, 0.2, 0.0),
+            Phase.CLOSE: (1.0, 0.4, 0.0),
+            Phase.LIFT: (0.8, 1.6, 0.0),
+            Phase.TRANSPORT: (0.8, 1.8, 0.0),
+            Phase.PLACE: (1.0, 2.0, 0.0),
+            Phase.OPEN: (0.7, 2.4, 0.0),
+            Phase.RETREAT: (0.8, 2.2, 0.0),
+            Phase.DONE: (0.0, 0.0, 0.0),
+        }
+        self.phase_joint_weights_map = {
+            Phase.PREGRASP: (35.0, 6.0),
+            Phase.DESCEND: (35.0, 6.0),
+            Phase.CLOSE: (35.0, 6.0),
+            Phase.LIFT: (20.0, 4.0),
+            Phase.TRANSPORT: (20.0, 4.0),
+            Phase.PLACE: (20.0, 4.0),
+            Phase.OPEN: (15.0, 3.0),
+            Phase.RETREAT: (15.0, 3.0),
+            Phase.DONE: (15.0, 3.0),
+        }
+        self.phase_grip_weights_map = {
+            Phase.PREGRASP: 20.0,
+            Phase.DESCEND: 20.0,
+            Phase.CLOSE: 80.0,
+            Phase.LIFT: 20.0,
+            Phase.TRANSPORT: 20.0,
+            Phase.PLACE: 20.0,
+            Phase.OPEN: 100.0,
+            Phase.RETREAT: 20.0,
+            Phase.DONE: 20.0,
+        }
 
-    def _solve_nominal_goal_qpos(self, goal_offset: jax.Array) -> np.ndarray:
-        """Solve a nominal IK pose for a cube-relative goal offset."""
+    def _solve_nominal_goal_qpos(self, goal_pos: jax.Array) -> np.ndarray:
+        """Solve a nominal IK pose for a world-space goal position."""
         mj_data = mujoco.MjData(self.mj_model)
         mujoco.mj_resetDataKeyframe(self.mj_model, mj_data, 0)
+        self.sync_target(mj_data)
         mujoco.mj_forward(self.mj_model, mj_data)
 
-        goal_pos = (
-            mj_data.xpos[self.object_body_idx].copy() + np.asarray(goal_offset)
-        )
         goal_rot = np.diag([1.0, -1.0, -1.0])
         jacp = np.zeros((3, self.mj_model.nv))
         jacr = np.zeros((3, self.mj_model.nv))
 
-        for _ in range(80):
+        for _ in range(100):
             mujoco.mj_forward(self.mj_model, mj_data)
             site_rot = mj_data.site_xmat[self.gripper_site_idx].reshape(3, 3)
-            pos_err = goal_pos - mj_data.site_xpos[self.gripper_site_idx]
+            ee_pos = mj_data.site_xpos[self.gripper_site_idx]
+            pos_err = np.asarray(goal_pos) - ee_pos
             ori_err = 0.5 * (
                 np.cross(site_rot[:, 0], goal_rot[:, 0])
                 + np.cross(site_rot[:, 1], goal_rot[:, 1])
@@ -118,9 +278,9 @@ class PickAndPlace(Task):
                 self.mj_model, mj_data, jacp, jacr, self.gripper_site_idx
             )
             jacobian = np.vstack([jacp[:, :7], jacr[:, :7]])
-            err = np.concatenate([pos_err, ori_err])
             dq = jacobian.T @ np.linalg.solve(
-                jacobian @ jacobian.T + 1e-3 * np.eye(6), err
+                jacobian @ jacobian.T + 1e-3 * np.eye(6),
+                np.concatenate([pos_err, ori_err]),
             )
             mj_data.qpos[:7] += np.clip(dq, -0.05, 0.05)
             mj_data.qpos[:7] = np.clip(
@@ -142,6 +302,7 @@ class PickAndPlace(Task):
         for _ in range(6):
             mj_data = mujoco.MjData(self.mj_model)
             mujoco.mj_resetDataKeyframe(self.mj_model, mj_data, 0)
+            self.sync_target(mj_data)
 
             for _ in range(500):
                 mj_data.ctrl[:] = ctrl
@@ -161,6 +322,10 @@ class PickAndPlace(Task):
         ctrl[self.gripper_idx] = finger_target
         return ctrl
 
+    def sync_target(self, mj_data: mujoco.MjData) -> None:
+        """Clamp the place marker to a floor-level object placement height."""
+        mj_data.mocap_pos[0, 2] = self.place_height
+
     def _ee(self, state: mjx.Data) -> jax.Array:
         return state.sensordata[self.ee_pos_adr : self.ee_pos_adr + 3]
 
@@ -173,24 +338,16 @@ class PickAndPlace(Task):
     def _obj(self, state: mjx.Data) -> jax.Array:
         return state.sensordata[self.obj_pos_adr : self.obj_pos_adr + 3]
 
-    def _phase_offset(self, phase: Phase) -> jax.Array:
-        if phase == Phase.PREGRASP:
-            return self.pregrasp_offset
-        return self.descend_offset
+    def _tgt(self, state: mjx.Data) -> jax.Array:
+        return state.sensordata[self.target_pos_adr : self.target_pos_adr + 3]
 
     def _phase_goal_qpos(self, phase: Phase) -> jax.Array:
-        if phase == Phase.PREGRASP:
-            return self.pregrasp_qpos
-        return self.descend_qpos
+        return self.phase_goal_qpos_map[phase]
 
     def phase_goal_ctrl(self, phase: Phase | None = None) -> jax.Array:
         """Return the nominal control target for a phase."""
         phase = self.phase if phase is None else phase
-        if phase == Phase.PREGRASP:
-            return self.pregrasp_ctrl
-        if phase == Phase.DESCEND:
-            return self.descend_ctrl
-        return self.close_ctrl
+        return self.phase_goal_ctrl_map[phase]
 
     def initial_knots(
         self, num_knots: int, phase: Phase | None = None
@@ -198,12 +355,45 @@ class PickAndPlace(Task):
         """Return a phase-centered spline initialization."""
         return jnp.tile(self.phase_goal_ctrl(phase), (num_knots, 1))
 
+    def _ee_goal_position(self, state: mjx.Data, phase: Phase) -> jax.Array:
+        if phase == Phase.PREGRASP:
+            return self._obj(state) + self.pregrasp_offset
+        if phase in (Phase.DESCEND, Phase.CLOSE):
+            return self._obj(state)
+        if phase == Phase.LIFT:
+            return self.lift_goal_pos
+        if phase == Phase.TRANSPORT:
+            return self._tgt(state) + self.carry_offset
+        if phase in (Phase.PLACE, Phase.OPEN):
+            return self._tgt(state)
+        return self._tgt(state) + self.retreat_offset
+
+    def _object_goal_position(self, state: mjx.Data, phase: Phase) -> jax.Array:
+        if phase in (Phase.PREGRASP, Phase.DESCEND, Phase.CLOSE):
+            return self._obj(state)
+        if phase == Phase.LIFT:
+            return self.lift_goal_pos
+        if phase == Phase.TRANSPORT:
+            return self._tgt(state) + self.carry_offset
+        return self._tgt(state)
+
     def goal_position(
         self, state: mjx.Data, phase: Phase | None = None
     ) -> jax.Array:
-        """Return the current phase goal position in world coordinates."""
+        """Return the current phase end-effector goal in world coordinates."""
         phase = self.phase if phase is None else phase
-        return self._obj(state) + self._phase_offset(phase)
+        return self._ee_goal_position(state, phase)
+
+    def object_goal_position(
+        self, state: mjx.Data, phase: Phase | None = None
+    ) -> jax.Array:
+        """Return the current phase object goal in world coordinates."""
+        phase = self.phase if phase is None else phase
+        return self._object_goal_position(state, phase)
+
+    def _target_from_data(self, mj_data: mujoco.MjData) -> jax.Array:
+        target = jnp.array(mj_data.mocap_pos[0])
+        return target.at[2].set(self.place_height)
 
     def goal_position_from_data(
         self, mj_data: mujoco.MjData, phase: Phase | None = None
@@ -211,18 +401,40 @@ class PickAndPlace(Task):
         """Goal position helper for the Python simulation loop."""
         phase = self.phase if phase is None else phase
         obj_pos = jnp.array(mj_data.xpos[self.object_body_idx])
-        return obj_pos + self._phase_offset(phase)
+        target_pos = self._target_from_data(mj_data)
+
+        if phase == Phase.PREGRASP:
+            return obj_pos + self.pregrasp_offset
+        if phase in (Phase.DESCEND, Phase.CLOSE):
+            return obj_pos
+        if phase == Phase.LIFT:
+            return self.lift_goal_pos
+        if phase == Phase.TRANSPORT:
+            return target_pos + self.carry_offset
+        if phase in (Phase.PLACE, Phase.OPEN):
+            return target_pos
+        return target_pos + self.retreat_offset
+
+    def object_goal_from_data(
+        self, mj_data: mujoco.MjData, phase: Phase | None = None
+    ) -> jax.Array:
+        """Object goal helper for the Python simulation loop."""
+        phase = self.phase if phase is None else phase
+        obj_pos = jnp.array(mj_data.xpos[self.object_body_idx])
+        target_pos = self._target_from_data(mj_data)
+
+        if phase in (Phase.PREGRASP, Phase.DESCEND, Phase.CLOSE):
+            return obj_pos
+        if phase == Phase.LIFT:
+            return self.lift_goal_pos
+        if phase == Phase.TRANSPORT:
+            return target_pos + self.carry_offset
+        return target_pos
 
     def reset_phase(self) -> None:
         """Reset the phase machine to the pregrasp stage."""
         self.phase = Phase.PREGRASP
         self._hold_count = 0
-
-    def _pose_error(
-        self, state: mjx.Data, phase: Phase | None = None
-    ) -> jax.Array:
-        phase = self.phase if phase is None else phase
-        return self.goal_position(state, phase) - self._ee(state)
 
     def _axis_alignment_cost(
         self, axis: jax.Array, target_axis: jax.Array
@@ -234,26 +446,25 @@ class PickAndPlace(Task):
         x_cost = self._axis_alignment_cost(self._ee_xaxis(state), _DESIRED_X)
         return z_cost + 0.5 * x_cost
 
-    def _position_cost(self, state: mjx.Data, phase: Phase) -> jax.Array:
-        pos_err = self._pose_error(state, phase)
-        xy_err = jnp.sqrt(jnp.sum(jnp.square(pos_err[:2])) + 1e-8)
+    def _l2_cost(self, vec: jax.Array) -> jax.Array:
+        return jnp.sqrt(jnp.sum(jnp.square(vec)) + 1e-8)
+
+    def _ee_position_cost(self, state: mjx.Data, phase: Phase) -> jax.Array:
+        goal = self._ee_goal_position(state, phase)
+        pos_err = goal - self._ee(state)
+        xy_err = self._l2_cost(pos_err[:2])
         z_err = jnp.abs(pos_err[2])
         return 100.0 * xy_err + 70.0 * z_err
+
+    def _object_position_cost(self, state: mjx.Data, phase: Phase) -> jax.Array:
+        goal = self._object_goal_position(state, phase)
+        return 120.0 * self._l2_cost(goal - self._obj(state))
 
     def _clearance_cost(self, state: mjx.Data) -> jax.Array:
         cube_top = self._obj(state)[2] + self.object_half_height
         ee_height = self._ee(state)[2]
         violation = jax.nn.relu(cube_top + self.MIN_CLEARANCE - ee_height)
         return jnp.square(violation)
-
-    def _object_motion_cost(self, state: mjx.Data, phase: Phase) -> jax.Array:
-        if phase == Phase.PREGRASP:
-            return jnp.array(0.0)
-
-        desired_obj = self.goal_position(state, phase) - self._phase_offset(
-            phase
-        )
-        return jnp.sum(jnp.square(self._obj(state) - desired_obj))
 
     def _velocity_cost(self, state: mjx.Data) -> jax.Array:
         return jnp.sum(jnp.square(state.qvel[:8]))
@@ -269,76 +480,86 @@ class PickAndPlace(Task):
         goal_ctrl = self.phase_goal_ctrl(phase)
         return jnp.sum(jnp.square(control[:7] - goal_ctrl[:7]))
 
-    def _gripper_cost(self, control: jax.Array, desired: float) -> jax.Array:
-        return jnp.square(control[self.gripper_idx] - desired)
+    def _phase_gripper_target(self, phase: Phase) -> float:
+        if phase in (
+            Phase.PREGRASP,
+            Phase.DESCEND,
+            Phase.OPEN,
+            Phase.RETREAT,
+            Phase.DONE,
+        ):
+            return self.gripper_open
+        return self.gripper_close
 
-    def _pose_hold_cost(
-        self,
-        state: mjx.Data,
-        control: jax.Array,
-        phase: Phase,
-        gripper_target: float,
-        clearance_weight: float,
-        object_weight: float,
+    def _gripper_cost(self, control: jax.Array, phase: Phase) -> jax.Array:
+        return jnp.square(
+            control[self.gripper_idx] - self._phase_gripper_target(phase)
+        )
+
+    def _phase_cost_weights(self, phase: Phase) -> Tuple[float, float, float]:
+        """Return ee/object/clearance weights for the running cost."""
+        return self.phase_cost_weights_map[phase]
+
+    def _phase_joint_weights(self, phase: Phase) -> Tuple[float, float]:
+        """Return joint-state and joint-control weights for a phase."""
+        return self.phase_joint_weights_map[phase]
+
+    def _phase_grip_weight(self, phase: Phase) -> float:
+        return self.phase_grip_weights_map[phase]
+
+    def _phase_running_cost(
+        self, state: mjx.Data, control: jax.Array
     ) -> jax.Array:
+        phase = self.phase
+        ee_w, obj_w, clearance_w = self._phase_cost_weights(phase)
+        joint_w, ctrl_w = self._phase_joint_weights(phase)
+
         return (
-            self._position_cost(state, phase)
+            ee_w * self._ee_position_cost(state, phase)
+            + obj_w * self._object_position_cost(state, phase)
             + 70.0 * self._orientation_cost(state)
-            + 35.0 * self._joint_state_cost(state, phase)
-            + 6.0 * self._joint_control_cost(control, phase)
-            + clearance_weight * self._clearance_cost(state)
-            + object_weight * self._object_motion_cost(state, phase)
-            + 2.0 * self._gripper_cost(control, gripper_target)
+            + joint_w * self._joint_state_cost(state, phase)
+            + ctrl_w * self._joint_control_cost(control, phase)
+            + clearance_w * self._clearance_cost(state)
+            + self._phase_grip_weight(phase)
+            * self._gripper_cost(control, phase)
             + 0.05 * self._velocity_cost(state)
         )
 
     def running_cost(self, state: mjx.Data, control: jax.Array) -> jax.Array:
         """Running cost for the current phase of the sequence."""
-        if self.phase == Phase.PREGRASP:
-            return self._pose_hold_cost(
-                state,
-                control,
-                Phase.PREGRASP,
-                self.gripper_open,
-                clearance_weight=250.0,
-                object_weight=0.0,
-            )
-
-        if self.phase == Phase.DESCEND:
-            return self._pose_hold_cost(
-                state,
-                control,
-                Phase.DESCEND,
-                self.gripper_open,
-                clearance_weight=0.0,
-                object_weight=30.0,
-            )
-
-        return self._pose_hold_cost(
-            state,
-            control,
-            Phase.CLOSE,
-            self.gripper_close,
-            clearance_weight=0.0,
-            object_weight=60.0,
-        )
+        if self.phase == Phase.DONE:
+            return 0.05 * self._velocity_cost(state)
+        return self._phase_running_cost(state, control)
 
     def terminal_cost(self, state: mjx.Data) -> jax.Array:
         """Terminal cost sharpens final accuracy for the active phase."""
         phase = self.phase
-        pos_err = self._pose_error(state, phase)
+        if phase == Phase.DONE:
+            return 2.0 * self._velocity_cost(state)
+
         return (
-            1000.0 * jnp.sum(jnp.square(pos_err))
+            1000.0
+            * jnp.sum(
+                jnp.square(
+                    self._ee_goal_position(state, phase) - self._ee(state)
+                )
+            )
+            + 1200.0
+            * jnp.sum(
+                jnp.square(
+                    self._object_goal_position(state, phase) - self._obj(state)
+                )
+            )
             + 220.0 * self._orientation_cost(state)
-            + 100.0 * self._joint_state_cost(state, phase)
+            + 90.0 * self._joint_state_cost(state, phase)
             + 15.0 * self._velocity_cost(state)
-            + 80.0 * self._object_motion_cost(state, phase)
         )
 
     def pose_error_from_data(
         self, mj_data: mujoco.MjData, phase: Phase | None = None
     ) -> Tuple[float, float]:
-        """Return Euclidean position error and orientation cost."""
+        """Return end-effector position error and orientation cost."""
         phase = self.phase if phase is None else phase
         goal = self.goal_position_from_data(mj_data, phase)
         ee_pos = jnp.array(mj_data.site_xpos[self.gripper_site_idx])
@@ -348,6 +569,15 @@ class PickAndPlace(Task):
         z_cost = float(self._axis_alignment_cost(xmat[:, 2], _DESIRED_Z))
         x_cost = float(self._axis_alignment_cost(xmat[:, 0], _DESIRED_X))
         return pos_err, z_cost + 0.5 * x_cost
+
+    def object_error_from_data(
+        self, mj_data: mujoco.MjData, phase: Phase | None = None
+    ) -> float:
+        """Return the object position error for the active phase."""
+        phase = self.phase if phase is None else phase
+        goal = self.object_goal_from_data(mj_data, phase)
+        obj_pos = jnp.array(mj_data.xpos[self.object_body_idx])
+        return float(jnp.linalg.norm(goal - obj_pos))
 
     def finger_width_from_data(self, mj_data: mujoco.MjData) -> float:
         """Return the average finger joint width."""
@@ -372,35 +602,83 @@ class PickAndPlace(Task):
 
         return False
 
+    def _is_gripper_open(self, mj_data: mujoco.MjData) -> bool:
+        return self.finger_width_from_data(mj_data) >= self.OPEN_FINGER_WIDTH
+
     def phase_complete(self, mj_data: mujoco.MjData) -> bool:
         """Check whether the active phase has been satisfied."""
-        if self.phase == Phase.CLOSE:
-            return (
+        phase = self.phase
+        if phase == Phase.DONE:
+            return True
+
+        ee_err, ori_err = self.pose_error_from_data(mj_data)
+        obj_err = self.object_error_from_data(mj_data)
+        result = False
+
+        if phase == Phase.PREGRASP:
+            result = (
+                ee_err <= self.PREGRASP_POS_TOL
+                and ori_err <= self.SUCCESS_ORI_TOL
+            )
+        elif phase == Phase.DESCEND:
+            result = (
+                ee_err <= self.DESCEND_POS_TOL
+                and ori_err <= self.SUCCESS_ORI_TOL
+            )
+        elif phase == Phase.CLOSE:
+            result = (
                 self.finger_width_from_data(mj_data) <= self.CLOSED_FINGER_WIDTH
                 and self.has_grasp_contacts(mj_data)
             )
+        elif phase in (Phase.LIFT, Phase.TRANSPORT):
+            result = (
+                obj_err <= self.CARRY_OBJ_TOL
+                and ori_err <= self.SUCCESS_ORI_TOL
+            )
+        elif phase == Phase.PLACE:
+            result = (
+                obj_err <= self.PLACE_OBJ_TOL
+                and ee_err <= self.DESCEND_POS_TOL * 2.0
+                and ori_err <= self.SUCCESS_ORI_TOL
+            )
+        elif phase == Phase.OPEN:
+            result = (
+                self._is_gripper_open(mj_data)
+                and obj_err <= self.PLACE_OBJ_TOL * 1.5
+            )
+        else:
+            result = (
+                ee_err <= self.RETREAT_POS_TOL
+                and ori_err <= self.SUCCESS_ORI_TOL
+                and self._is_gripper_open(mj_data)
+                and obj_err <= self.PLACE_OBJ_TOL * 1.5
+            )
 
-        pos_err, ori_err = self.pose_error_from_data(mj_data)
-        pos_tol = (
-            self.PREGRASP_POS_TOL
-            if self.phase == Phase.PREGRASP
-            else self.DESCEND_POS_TOL
-        )
-        return pos_err <= pos_tol and ori_err <= self.SUCCESS_ORI_TOL
+        return result
+
+    def _phase_hold_steps(self, phase: Phase) -> int:
+        return self.phase_hold_steps_map[phase]
 
     def goal_reached(self, mj_data: mujoco.MjData) -> bool:
         """Compatibility helper for checking current phase completion."""
         return self.phase_complete(mj_data)
 
     def close_stable(self) -> bool:
-        """Return whether the close phase has been stably achieved."""
+        """Return whether the object has been securely grasped."""
         return (
-            self.phase == Phase.CLOSE
-            and self._hold_count >= self.CLOSE_CONTACT_HOLD_STEPS
+            self.phase >= Phase.LIFT
+            or (
+                self.phase == Phase.CLOSE
+                and self._hold_count >= self.CLOSE_CONTACT_HOLD_STEPS
+            )
         )
 
+    def sequence_complete(self) -> bool:
+        """Return whether the full pick-and-place sequence is complete."""
+        return self.phase == Phase.DONE
+
     def update_phase(self, mj_data: mujoco.MjData) -> bool:
-        """Advance from pregrasp to descend to close when goals are met."""
+        """Advance through the pick-and-place phases."""
         old_phase = self.phase
 
         if self.phase_complete(mj_data):
@@ -408,18 +686,10 @@ class PickAndPlace(Task):
         else:
             self._hold_count = 0
 
-        if self.phase == Phase.PREGRASP:
-            if self._hold_count >= self.PREGRASP_HOLD_STEPS:
-                self.phase = Phase.DESCEND
+        if self._hold_count >= self._phase_hold_steps(self.phase):
+            self.phase = self.phase_next_map[self.phase]
+            if self.phase != old_phase:
                 self._hold_count = 0
-        elif self.phase == Phase.DESCEND:
-            if self._hold_count >= self.DESCEND_HOLD_STEPS:
-                self.phase = Phase.CLOSE
-                self._hold_count = 0
-        elif self.phase == Phase.CLOSE:
-            self._hold_count = min(
-                self._hold_count, self.CLOSE_CONTACT_HOLD_STEPS
-            )
 
         changed = self.phase != old_phase
         if changed:

@@ -13,11 +13,10 @@ from hydrax.algs import MPPI
 from hydrax.tasks.pick_and_place import Phase, PickAndPlace
 
 """
-Run a minimal pregrasp -> descend -> close sequence for the Panda arm.
+Run a full pick-and-place sequence for the Panda arm.
 
-The task keeps the controller narrow and explicit: first stabilize 5 cm above
-the cube, then descend onto the cube centerline, then hold the wrist pose while
-closing the fingers onto the object.
+The task keeps the target marker on the floor plane, picks the cube up, carries
+it to the target marker, places it, opens the fingers, and retreats upward.
 """
 
 warnings.filterwarnings(
@@ -66,7 +65,7 @@ sim_steps_per_replan = max(int(1.0 / FREQ / mj_model.opt.timestep), 1)
 step_dt = sim_steps_per_replan * mj_model.opt.timestep
 actual_freq = 1.0 / step_dt
 
-mj_data.mocap_pos[0] = np.asarray(task.goal_position_from_data(mj_data))
+task.sync_target(mj_data)
 mujoco.mj_forward(mj_model, mj_data)
 state_time = jnp.asarray(mj_data.time, dtype=jnp.float32)
 
@@ -134,7 +133,7 @@ print(
     f"{ctrl.iterations} iters)\n"
 )
 
-print("JIT-compiling pregrasp, descend, and close phases ...")
+print("JIT-compiling all pick-and-place phases ...")
 all_st = time.time()
 phase_jit = {}
 phase_params = {}
@@ -173,11 +172,10 @@ with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
     while viewer.is_running():
         t0 = time.time()
 
-        mj_data.mocap_pos[0] = np.asarray(task.goal_position_from_data(mj_data))
+        task.sync_target(mj_data)
         state_time = jnp.asarray(mj_data.time, dtype=jnp.float32)
 
         phase = task.phase
-        controller = controllers[phase]
         planner_state = planner_data[phase].replace(
             qpos=jnp.array(mj_data.qpos),
             qvel=jnp.array(mj_data.qvel),
@@ -189,7 +187,7 @@ with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
 
         jit_opt, jit_interp = phase_jit[phase]
         rollouts = None
-        if task.close_stable():
+        if task.sequence_complete():
             plan_ms = 0.0
             us = np.repeat(
                 np.asarray(task.phase_goal_ctrl())[None, :],
@@ -246,6 +244,7 @@ with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
             )
 
         pos_err, ori_err = task.pose_error_from_data(mj_data)
+        obj_err = task.object_error_from_data(mj_data)
         finger = task.finger_width_from_data(mj_data)
         contacts = int(task.has_grasp_contacts(mj_data))
         success = int(task.goal_reached(mj_data))
@@ -263,6 +262,7 @@ with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
             f"budget={step_dt*1000:.0f}ms  "
             f"rtr={rtr:.2f}  "
             f"pos={100*pos_err:4.1f}cm  "
+            f"obj={100*obj_err:4.1f}cm  "
             f"ori={ori_err:5.3f}  "
             f"finger={100*finger:4.1f}cm  "
             f"contacts={contacts}  "
