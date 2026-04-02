@@ -44,6 +44,7 @@ class MPPI(SamplingBasedController):
         spline_type: Literal["zero", "linear", "cubic"] = "zero",
         num_knots: int = 4,
         iterations: int = 1,
+        step_size: float = 1.0,
     ) -> None:
         """Initialize the controller.
 
@@ -62,6 +63,9 @@ class MPPI(SamplingBasedController):
                          Defaults to "zero" (zero-order hold).
             num_knots: The number of knots in the control spline.
             iterations: The number of optimization iterations to perform.
+            step_size: Blending factor for mean update (0, 1]. At 1.0, the mean
+                       is fully replaced (standard MPPI). Lower values blend
+                       with the previous mean for smoother convergence.
         """
         super().__init__(
             task,
@@ -76,6 +80,7 @@ class MPPI(SamplingBasedController):
         self.noise_level = noise_level
         self.num_samples = num_samples
         self.temperature = temperature
+        self.step_size = step_size
 
     def init_params(
         self, initial_knots: jax.Array = None, seed: int = 0
@@ -105,5 +110,6 @@ class MPPI(SamplingBasedController):
         costs = jnp.sum(rollouts.costs, axis=1)  # sum over time steps
         # N.B. jax.nn.softmax takes care of details like baseline subtraction.
         weights = jax.nn.softmax(-costs / self.temperature, axis=0)
-        mean = jnp.sum(weights[:, None, None] * rollouts.knots, axis=0)
+        weighted_mean = jnp.sum(weights[:, None, None] * rollouts.knots, axis=0)
+        mean = (1.0 - self.step_size) * params.mean + self.step_size * weighted_mean
         return params.replace(mean=mean)
