@@ -11,3 +11,4 @@ hydrax/recordings/
 .direnv
 .nix-override-bin
 .venv
+.ruff_cache

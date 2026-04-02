@@ -1,4 +1,5 @@
 import time
+import warnings
 from typing import Any, Callable
 
 import jax
@@ -19,21 +20,41 @@ the cube, then descend onto the cube centerline, then hold the wrist pose while
 closing the fingers onto the object.
 """
 
+warnings.filterwarnings(
+    "ignore",
+    message="overflow encountered in cast",
+    module=r"jax\._src\.abstract_arrays",
+)
+
 # -- task & controller -------------------------------------------------
 task = PickAndPlace()
 
-ctrl = MPPI(
-    task,
-    num_samples=128,
-    noise_level=0.03,
-    temperature=0.5,
-    step_size=0.2,
-    num_randomizations=1,
-    plan_horizon=0.5,
-    spline_type="zero",
-    num_knots=6,
-    iterations=1,
-)
+
+def make_controller(planner_task: PickAndPlace) -> MPPI:
+    """Create an MPPI controller for one fixed planning phase."""
+    return MPPI(
+        planner_task,
+        num_samples=128,
+        noise_level=0.03,
+        temperature=0.5,
+        step_size=0.2,
+        num_randomizations=1,
+        plan_horizon=0.5,
+        spline_type="zero",
+        num_knots=6,
+        iterations=1,
+    )
+
+
+planner_tasks = {}
+controllers = {}
+for phase in Phase:
+    planner_task = PickAndPlace()
+    planner_task.phase = phase
+    planner_tasks[phase] = planner_task
+    controllers[phase] = make_controller(planner_task)
+
+ctrl = controllers[Phase.PREGRASP]
 
 # -- simulation setup --------------------------------------------------
 mj_model = task.mj_model
@@ -47,13 +68,25 @@ actual_freq = 1.0 / step_dt
 
 mj_data.mocap_pos[0] = np.asarray(task.goal_position_from_data(mj_data))
 mujoco.mj_forward(mj_model, mj_data)
+state_time = jnp.asarray(mj_data.time, dtype=jnp.float32)
 
 mjx_data = task.make_data().replace(
     qpos=jnp.array(mj_data.qpos),
     qvel=jnp.array(mj_data.qvel),
     mocap_pos=jnp.array(mj_data.mocap_pos),
     mocap_quat=jnp.array(mj_data.mocap_quat),
+    time=state_time,
 )
+planner_data = {
+    phase: planner_task.make_data().replace(
+        qpos=jnp.array(mj_data.qpos),
+        qvel=jnp.array(mj_data.qvel),
+        mocap_pos=jnp.array(mj_data.mocap_pos),
+        mocap_quat=jnp.array(mj_data.mocap_quat),
+        time=state_time,
+    )
+    for phase, planner_task in planner_tasks.items()
+}
 
 # -- trace rendering settings ------------------------------------------
 SHOW_TRACES = False
@@ -63,11 +96,9 @@ TRACE_COLOR = [0.2, 0.8, 0.2, 0.15]
 
 
 def warmup_phase(
-    phase: Phase, controller: MPPI, warmup_data: mjx.Data
-) -> tuple[Callable[..., Any], Callable[..., Any]]:
+    controller: MPPI, warmup_data: mjx.Data
+) -> tuple[Callable[..., Any], Callable[..., Any], Any]:
     """JIT-compile the planner for one specific task phase."""
-    controller.task.phase = phase
-
     def _optimize(state: mjx.Data, params: Any) -> tuple[Any, Any]:
         return controller.optimize(state, params)
 
@@ -77,17 +108,21 @@ def warmup_phase(
     jit_opt = jax.jit(_optimize)
     jit_interp = jax.jit(_interp)
     params = controller.init_params(
-        initial_knots=controller.task.initial_knots(controller.num_knots, phase)
+        initial_knots=controller.task.initial_knots(controller.num_knots)
     )
 
-    params, _ = jit_opt(warmup_data, params)
-    params, _ = jit_opt(warmup_data, params)
+    params, rollouts = jit_opt(warmup_data, params)
+    jax.block_until_ready(rollouts.costs)
+    params, rollouts = jit_opt(warmup_data, params)
+    jax.block_until_ready(rollouts.costs)
 
     tq = jnp.arange(sim_steps_per_replan) * mj_model.opt.timestep
-    jit_interp(tq, params.tk, params.mean[None, ...])
-    jit_interp(tq, params.tk, params.mean[None, ...])
+    interp = jit_interp(tq, params.tk, params.mean[None, ...])
+    jax.block_until_ready(interp)
+    interp = jit_interp(tq, params.tk, params.mean[None, ...])
+    jax.block_until_ready(interp)
 
-    return jit_opt, jit_interp
+    return jit_opt, jit_interp, params
 
 
 print(f"JAX backend: {jax.default_backend()}, devices: {jax.devices()}")
@@ -102,16 +137,22 @@ print(
 print("JIT-compiling pregrasp, descend, and close phases ...")
 all_st = time.time()
 phase_jit = {}
+phase_params = {}
 for phase in Phase:
     st = time.time()
-    phase_jit[phase] = warmup_phase(phase, ctrl, mjx_data)
+    jit_opt, jit_interp, params = warmup_phase(
+        controllers[phase], planner_data[phase]
+    )
+    phase_jit[phase] = (jit_opt, jit_interp)
+    phase_params[phase] = params.replace(
+        mean=planner_tasks[phase].initial_knots(controllers[phase].num_knots)
+    )
+    _, rollouts = jit_opt(planner_data[phase], phase_params[phase])
+    jax.block_until_ready(rollouts.costs)
     print(f"  {phase.name:>9s}  {time.time() - st:.1f}s")
 print(f"Warmup complete in {time.time() - all_st:.1f}s\n")
 
 task.reset_phase()
-policy_params = ctrl.init_params(
-    initial_knots=task.initial_knots(ctrl.num_knots)
-)
 
 # -- main loop ---------------------------------------------------------
 with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
@@ -133,16 +174,20 @@ with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
         t0 = time.time()
 
         mj_data.mocap_pos[0] = np.asarray(task.goal_position_from_data(mj_data))
+        state_time = jnp.asarray(mj_data.time, dtype=jnp.float32)
 
-        mjx_data = mjx_data.replace(
+        phase = task.phase
+        controller = controllers[phase]
+        planner_state = planner_data[phase].replace(
             qpos=jnp.array(mj_data.qpos),
             qvel=jnp.array(mj_data.qvel),
             mocap_pos=jnp.array(mj_data.mocap_pos),
             mocap_quat=jnp.array(mj_data.mocap_quat),
-            time=mj_data.time,
+            time=state_time,
         )
+        mjx_data = planner_state
 
-        jit_opt, jit_interp = phase_jit[task.phase]
+        jit_opt, jit_interp = phase_jit[phase]
         rollouts = None
         if task.close_stable():
             plan_ms = 0.0
@@ -153,7 +198,10 @@ with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
             )
         else:
             plan_t0 = time.time()
-            policy_params, rollouts = jit_opt(mjx_data, policy_params)
+            phase_params[phase], rollouts = jit_opt(
+                planner_state, phase_params[phase]
+            )
+            jax.block_until_ready(rollouts.costs)
             plan_ms = (time.time() - plan_t0) * 1000
 
         if SHOW_TRACES and rollouts is not None:
@@ -176,7 +224,11 @@ with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
                 + mj_data.time
             )
             us = np.asarray(
-                jit_interp(tq, policy_params.tk, policy_params.mean[None, ...])
+                jit_interp(
+                    tq,
+                    phase_params[phase].tk,
+                    phase_params[phase].mean[None, ...],
+                )
             )[0]
 
         for i in range(sim_steps_per_replan):
@@ -186,8 +238,11 @@ with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
 
         changed = task.update_phase(mj_data)
         if changed:
-            policy_params = ctrl.init_params(
-                initial_knots=task.initial_knots(ctrl.num_knots)
+            next_phase = task.phase
+            phase_params[next_phase] = controllers[next_phase].init_params(
+                initial_knots=planner_tasks[next_phase].initial_knots(
+                    controllers[next_phase].num_knots
+                )
             )
 
         pos_err, ori_err = task.pose_error_from_data(mj_data)
