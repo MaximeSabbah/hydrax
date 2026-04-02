@@ -26,14 +26,14 @@ task = PickAndPlace()
 
 ctrl = MPPI(
     task,
-    num_samples=128,
-    noise_level=0.1,
-    temperature=0.5,
-    step_size=0.55,
+    num_samples=64,
+    noise_level=0.08,
+    temperature=0.3,
+    step_size=0.25,
     num_randomizations=1,
-    plan_horizon=0.15,
+    plan_horizon=0.3,
     spline_type="zero",
-    num_knots=6,
+    num_knots=8,
     iterations=1,
 )
 
