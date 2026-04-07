@@ -37,6 +37,23 @@ class Trajectory:
 
 
 @dataclass
+class LinearFeedbackPolicy:
+    """Local linear feedback policy around the current planning state.
+
+    The intended usage is
+
+        u(x) ≈ feedforward + feedback_gain @ (state_reference - x)
+
+    which matches the sign convention used by linear feedback controllers that
+    track a desired state.
+    """
+
+    feedforward: jax.Array
+    feedback_gain: jax.Array
+    state_reference: jax.Array
+
+
+@dataclass
 class SamplingParams:
     """Parameters for sampling-based control algorithms.
 

@@ -63,6 +63,28 @@ class PickAndPlace(Task):
             ROOT + "/models/panda/scene.xml"
         )
         super().__init__(mj_model, trace_sites=["gripper"], impl=impl)
+        self.feedback_joint_names = (
+            "joint1",
+            "joint2",
+            "joint3",
+            "joint4",
+            "joint5",
+            "joint6",
+            "joint7",
+            "finger_joint1",
+        )
+        self.feedback_qpos_idx = jnp.array(
+            [
+                mj_model.jnt_qposadr[mj_model.joint(name).id]
+                for name in self.feedback_joint_names
+            ]
+        )
+        self.feedback_qvel_idx = jnp.array(
+            [
+                mj_model.jnt_dofadr[mj_model.joint(name).id]
+                for name in self.feedback_joint_names
+            ]
+        )
 
         self.ee_pos_adr = mj_model.sensor_adr[mj_model.sensor("ee_pos").id]
         self.ee_xaxis_adr = mj_model.sensor_adr[mj_model.sensor("ee_xaxis").id]
@@ -99,6 +121,11 @@ class PickAndPlace(Task):
 
         self.phase = Phase.PREGRASP
         self._hold_count = 0
+
+    @property
+    def feedback_state_dim(self) -> int:
+        """Dimension of the low-level Panda feedback state."""
+        return 2 * len(self.feedback_joint_names)
 
     def _init_reference_targets(self) -> None:
         """Initialize the default object and target reference positions."""
@@ -436,6 +463,31 @@ class PickAndPlace(Task):
         if phase == Phase.PLACE:
             return target_pos + self.place_offset
         return target_pos
+
+    def feedback_state(self, state: mjx.Data) -> jax.Array:
+        """Expose only the actuated Panda joints to the feedback layer."""
+        qpos = state.qpos[self.feedback_qpos_idx]
+        qvel = state.qvel[self.feedback_qvel_idx]
+        return jnp.concatenate([qpos, qvel])
+
+    def feedback_state_from_data(self, mj_data: mujoco.MjData) -> jax.Array:
+        """Project MuJoCo data to the controlled Panda joint state."""
+        qpos = jnp.array(mj_data.qpos)[self.feedback_qpos_idx]
+        qvel = jnp.array(mj_data.qvel)[self.feedback_qvel_idx]
+        return jnp.concatenate([qpos, qvel])
+
+    def set_feedback_state(
+        self, state: mjx.Data, feedback_state: jax.Array
+    ) -> mjx.Data:
+        """Inject only the controlled Panda joint state into an MJX state."""
+        num_qpos = len(self.feedback_joint_names)
+        qpos = state.qpos.at[self.feedback_qpos_idx].set(
+            feedback_state[:num_qpos]
+        )
+        qvel = state.qvel.at[self.feedback_qvel_idx].set(
+            feedback_state[num_qpos:]
+        )
+        return state.replace(qpos=qpos, qvel=qvel)
 
     def reset_phase(self) -> None:
         """Reset the phase machine to the pregrasp stage."""

@@ -61,6 +61,11 @@ class Task(ABC):
             [mj_model.site(name).id for name in trace_sites]
         )
 
+    @property
+    def feedback_state_dim(self) -> int:
+        """Dimension of the compact feedback state used for local gains."""
+        return self.mj_model.nq + self.mj_model.nv
+
     @abstractmethod
     def running_cost(self, state: mjx.Data, control: jax.Array) -> jax.Array:
         """The running cost ℓ(xₜ, uₜ).
@@ -158,3 +163,28 @@ class Task(ABC):
             A new `mjx.Data` instance for this task.
         """
         return mjx.make_data(self.mj_model, impl=self.model.impl, **kwargs)
+
+    def feedback_state(self, state: mjx.Data) -> jax.Array:
+        """Project an MJX state to the vector used by linear feedback laws.
+
+        By default, this uses the MuJoCo generalized positions and velocities,
+        stacked as ``[qpos, qvel]``. Tasks with manifold-aware state errors can
+        override this method and ``set_feedback_state`` to expose a different
+        local linearization state.
+        """
+        return jnp.concatenate([state.qpos, state.qvel])
+
+    def feedback_state_from_data(self, mj_data: mujoco.MjData) -> jax.Array:
+        """Project a MuJoCo simulation state to the feedback-state vector."""
+        return jnp.concatenate(
+            [jnp.array(mj_data.qpos), jnp.array(mj_data.qvel)]
+        )
+
+    def set_feedback_state(
+        self, state: mjx.Data, feedback_state: jax.Array
+    ) -> mjx.Data:
+        """Inject a compact feedback-state vector back into an MJX state."""
+        nq = self.mj_model.nq
+        qpos = feedback_state[:nq]
+        qvel = feedback_state[nq:]
+        return state.replace(qpos=qpos, qvel=qvel)

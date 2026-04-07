@@ -36,6 +36,7 @@ def make_controller(planner_task: PickAndPlace) -> MPPI:
         num_samples=128,
         noise_level=0.03,
         temperature=0.5,
+        feedback_num_samples=4,
         step_size=0.2,
         num_randomizations=1,
         plan_horizon=0.5,
@@ -98,8 +99,8 @@ def warmup_phase(
     controller: MPPI, warmup_data: mjx.Data
 ) -> tuple[Callable[..., Any], Callable[..., Any], Any]:
     """JIT-compile the planner for one specific task phase."""
-    def _optimize(state: mjx.Data, params: Any) -> tuple[Any, Any]:
-        return controller.optimize(state, params)
+    def _optimize(state: mjx.Data, params: Any) -> tuple[Any, Any, Any]:
+        return controller.optimize_with_feedback(state, params)
 
     def _interp(tq: jax.Array, tk: jax.Array, knots: jax.Array) -> jax.Array:
         return controller.interp_func(tq, tk, knots)
@@ -110,14 +111,10 @@ def warmup_phase(
         initial_knots=controller.task.initial_knots(controller.num_knots)
     )
 
-    params, rollouts = jit_opt(warmup_data, params)
-    jax.block_until_ready(rollouts.costs)
-    params, rollouts = jit_opt(warmup_data, params)
-    jax.block_until_ready(rollouts.costs)
+    params, rollouts, feedback = jit_opt(warmup_data, params)
+    jax.block_until_ready(feedback.feedback_gain)
 
     tq = jnp.arange(sim_steps_per_replan) * mj_model.opt.timestep
-    interp = jit_interp(tq, params.tk, params.mean[None, ...])
-    jax.block_until_ready(interp)
     interp = jit_interp(tq, params.tk, params.mean[None, ...])
     jax.block_until_ready(interp)
 
@@ -146,8 +143,6 @@ for phase in Phase:
     phase_params[phase] = params.replace(
         mean=planner_tasks[phase].initial_knots(controllers[phase].num_knots)
     )
-    _, rollouts = jit_opt(planner_data[phase], phase_params[phase])
-    jax.block_until_ready(rollouts.costs)
     print(f"  {phase.name:>9s}  {time.time() - st:.1f}s")
 print(f"Warmup complete in {time.time() - all_st:.1f}s\n")
 
@@ -187,6 +182,7 @@ with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
 
         jit_opt, jit_interp = phase_jit[phase]
         rollouts = None
+        feedback = None
         if task.sequence_complete():
             plan_ms = 0.0
             us = np.repeat(
@@ -196,10 +192,10 @@ with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
             )
         else:
             plan_t0 = time.time()
-            phase_params[phase], rollouts = jit_opt(
+            phase_params[phase], rollouts, feedback = jit_opt(
                 planner_state, phase_params[phase]
             )
-            jax.block_until_ready(rollouts.costs)
+            jax.block_until_ready(feedback.feedback_gain)
             plan_ms = (time.time() - plan_t0) * 1000
 
         if SHOW_TRACES and rollouts is not None:
@@ -255,12 +251,16 @@ with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
             time.sleep(step_dt - elapsed)
 
         rtr = step_dt / (time.time() - t0)
+        gain_norm = 0.0 if feedback is None else float(
+            jnp.linalg.norm(feedback.feedback_gain)
+        )
         print(
             f"[{task.phase.name:>9s}] "
             f"loop={loop_ms:5.1f}ms  "
             f"plan={plan_ms:5.1f}ms  "
             f"budget={step_dt*1000:.0f}ms  "
             f"rtr={rtr:.2f}  "
+            f"|K|={gain_norm:6.2f}  "
             f"pos={100*pos_err:4.1f}cm  "
             f"obj={100*obj_err:4.1f}cm  "
             f"ori={ori_err:5.3f}  "
