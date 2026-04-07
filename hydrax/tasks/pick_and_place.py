@@ -34,6 +34,7 @@ class PickAndPlace(Task):
 
     PREGRASP_CLEARANCE = 0.05
     CARRY_CLEARANCE = 0.12
+    PLACE_CLEARANCE = 0.005
     RETREAT_CLEARANCE = 0.05
     MIN_CLEARANCE = 0.02
 
@@ -88,6 +89,7 @@ class PickAndPlace(Task):
             [0.0, 0.0, self.object_half_height + self.PREGRASP_CLEARANCE]
         )
         self.carry_offset = jnp.array([0.0, 0.0, self.CARRY_CLEARANCE])
+        self.place_offset = jnp.array([0.0, 0.0, self.PLACE_CLEARANCE])
         self.retreat_offset = jnp.array(
             [0.0, 0.0, self.object_half_height + self.RETREAT_CLEARANCE]
         )
@@ -116,7 +118,7 @@ class PickAndPlace(Task):
         self.descend_goal_pos = self.initial_object_pos
         self.lift_goal_pos = self.initial_object_pos + self.carry_offset
         self.transport_goal_pos = self.default_target_pos + self.carry_offset
-        self.place_goal_pos = self.default_target_pos
+        self.place_goal_pos = self.default_target_pos + self.place_offset
         self.retreat_goal_pos = self.default_target_pos + self.retreat_offset
 
     def _init_nominal_controls(self) -> None:
@@ -365,7 +367,7 @@ class PickAndPlace(Task):
         if phase == Phase.TRANSPORT:
             return self._tgt(state) + self.carry_offset
         if phase in (Phase.PLACE, Phase.OPEN):
-            return self._tgt(state)
+            return self._tgt(state) + self.place_offset
         return self._tgt(state) + self.retreat_offset
 
     def _object_goal_position(self, state: mjx.Data, phase: Phase) -> jax.Array:
@@ -375,6 +377,8 @@ class PickAndPlace(Task):
             return self.lift_goal_pos
         if phase == Phase.TRANSPORT:
             return self._tgt(state) + self.carry_offset
+        if phase == Phase.PLACE:
+            return self._tgt(state) + self.place_offset
         return self._tgt(state)
 
     def goal_position(
@@ -412,7 +416,7 @@ class PickAndPlace(Task):
         if phase == Phase.TRANSPORT:
             return target_pos + self.carry_offset
         if phase in (Phase.PLACE, Phase.OPEN):
-            return target_pos
+            return target_pos + self.place_offset
         return target_pos + self.retreat_offset
 
     def object_goal_from_data(
@@ -429,6 +433,8 @@ class PickAndPlace(Task):
             return self.lift_goal_pos
         if phase == Phase.TRANSPORT:
             return target_pos + self.carry_offset
+        if phase == Phase.PLACE:
+            return target_pos + self.place_offset
         return target_pos
 
     def reset_phase(self) -> None:
