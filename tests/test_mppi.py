@@ -166,7 +166,7 @@ def test_feedback_gain_matches_pendulum_finite_difference() -> None:
     assert np.allclose(x_ref, x0, atol=1e-6)
     assert np.all(np.isfinite(K))
     assert np.allclose(ff, u0, atol=1e-6)
-    assert np.linalg.norm(K + jac) / np.linalg.norm(jac) < 0.25
+    assert np.linalg.norm(K + jac) / np.linalg.norm(jac) < 0.05
 
 
 if __name__ == "__main__":
