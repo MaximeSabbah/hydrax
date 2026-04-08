@@ -218,34 +218,27 @@ class MPPI(SamplingBasedController):
     ) -> LinearFeedbackPolicy:
         """Compute a local linear feedback policy.
 
-        This policy is built from the final MPPI samples.
+        The gain is the negative Jacobian of the MPPI weighted-average
+        action with respect to the initial feedback state, following
+        the Feedback-MPPI derivation (hal-05115336).
         """
         costs = jnp.sum(rollouts.costs, axis=1)
         sample_inds = self._feedback_sample_inds(costs)
-        costs = costs[sample_inds]
         knots = rollouts.knots[sample_inds]
-        controls = rollouts.controls[sample_inds]
-        weights = jax.nn.softmax(-costs / self.temperature, axis=0)
 
         state_reference = self.task.feedback_state(state)
-        cost_grads = self._rollout_cost_gradients(
+        feedforward = self.get_action(params, state.time)
+
+        # K = -du*/dx where u* is the MPPI weighted-average action.
+        # Forward-mode AD is used because MJX's Newton solver relies
+        # on while_loop, which is compatible with jacfwd.
+        jac = jax.jacfwd(self._weighted_action_at_t0, argnums=0)(
             state_reference, state, params.tk, knots, dr_rng
         )
-        mean_grad = jnp.sum(weights[:, None] * cost_grads, axis=0)
-        centered_grads = cost_grads - mean_grad
 
-        nominal_action = self.interp_func(
-            state.time, params.tk, nominal_knots[None, ...]
-        )[0]
-        action_deltas = controls[:, 0, :] - nominal_action[None, :]
-
-        feedback_gain = (self.step_size / self.temperature) * jnp.einsum(
-            "s,si,sj->ij", weights, action_deltas, centered_grads
-        )
-        feedforward = self.get_action(params, state.time)
         return LinearFeedbackPolicy(
             feedforward=feedforward,
-            feedback_gain=feedback_gain,
+            feedback_gain=-jac,
             state_reference=state_reference,
         )
 
@@ -256,21 +249,7 @@ class MPPI(SamplingBasedController):
             return jnp.arange(self.num_samples)
         return jnp.argsort(costs)[:num_feedback]
 
-    def _rollout_cost_gradients(
-        self,
-        state_reference: jax.Array,
-        state: mjx.Data,
-        tk: jax.Array,
-        knots: jax.Array,
-        dr_rng: jax.Array,
-    ) -> jax.Array:
-        """Differentiate each rollout cost with respect to the initial state."""
-        # MJX's solver uses while_loop internally, which is compatible with
-        # forward-mode differentiation but not reverse-mode in this setting.
-        grad_fn = jax.jacfwd(self._rollout_total_costs, argnums=0)
-        return grad_fn(state_reference, state, tk, knots, dr_rng)
-
-    def _rollout_total_costs(
+    def _weighted_action_at_t0(
         self,
         feedback_state: jax.Array,
         state: mjx.Data,
@@ -278,10 +257,22 @@ class MPPI(SamplingBasedController):
         knots: jax.Array,
         dr_rng: jax.Array,
     ) -> jax.Array:
-        """Compute total rollout costs for a batch of sampled knot sequences."""
-        rollout_state = self.task.set_feedback_state(state, feedback_state)
+        """MPPI weighted-average action at the first control step.
+
+        Only the importance weights depend on ``feedback_state``; the
+        control sequences are held fixed.  Differentiating this
+        function w.r.t. ``feedback_state`` yields the sensitivity of
+        the optimal action to initial-state perturbations.
+        """
+        rollout_state = self.task.set_feedback_state(
+            state, feedback_state
+        )
         rollout_state = mjx.forward(self.task.model, rollout_state)
         rollouts = self.rollout_with_randomizations(
             rollout_state, tk, knots, dr_rng
         )
-        return jnp.sum(rollouts.costs, axis=1)
+        costs = jnp.sum(rollouts.costs, axis=1)
+        weights = jax.nn.softmax(-costs / self.temperature, axis=0)
+        return jnp.sum(
+            weights[:, None] * rollouts.controls[:, 0, :], axis=0
+        )
