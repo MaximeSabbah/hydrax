@@ -9,7 +9,9 @@ backend behind the existing `sbmpc_ros` stack.
 
 | Date | Decision |
 |------|----------|
-| 2026-07-03 | **sbmpc results are not a reference.** No baseline fixtures, no parity comparisons against sbmpc runs. All validation gates are absolute and self-contained in hydrax. (sbmpc code is still the source for the ported gain math and for config starting points — its *outputs* are not a target.) |
+| 2026-07-03 | **sbmpc results are not a reference — its implementation is.** No baseline fixtures, no parity comparisons against sbmpc runs; all validation gates are absolute and self-contained in hydrax. sbmpc remains the reference for *code*: the gain implementation, how the dynamics is wired, the 25 Hz control-loop timing structure, and solver parameter starting points. |
+| 2026-07-03 | **Cost functions are hydrax-native.** Written in the house style of the existing hydrax tasks (plain quadratics, O(1) weights); sbmpc's cost magnitudes are never copied — they belong to a differently normalized pipeline. |
+| 2026-07-03 | **Future (post-plan): an "optimizer" task mode** where MPPI finds its own trajectory from meta costs (e.g. end-effector pose), like sbmpc's optimizer fallback. Out of scope until trajectory tracking is validated; the task keeps its reference machinery separable so this mode can be added without a rewrite. |
 | 2026-07-03 | Port lives **in-tree in this hydrax fork** (`hydrax/algs/`, `hydrax/tasks/`, `examples/`), not a separate package. Upstream (`vincekurtz/hydrax`) stays a configured remote; rebase cost accepted. |
 | 2026-07-03 | **No bridge-side gain conditioning.** EMA filtering / norm clamping / `feedback_gain_scale` in the ROS bridge are rejected. K must come out of the optimizer deployable; gain quality is a solver-level requirement (Phase 3). |
 | 2026-07-03 | **Two-tier validation.** Tier A validates the controller entirely inside this repo (one example script + pytest, no ROS). Tier B validates the machinery through the `sbmpc_ros` launch with LFC. A phase may not enter Tier B until its Tier A checks pass. |
@@ -77,15 +79,23 @@ plan from the start state to the IK solution, with `tau_ff` from MuJoCo
 inverse dynamics along the plan. The plan arrays live on the task and are
 indexed by `x.time` inside `running_cost(x, u)` / `terminal_cost(x)`
 (`humanoid_mocap` is the in-repo precedent for time-indexed references). Cost
-terms: position, velocity, control regularization — the same three terms as
-sbmpc's pregrasp config, whose weights serve only as the starting point for
-Phase 3 tuning.
+terms: position, velocity, control-around-feedforward — plain quadratics with
+O(1) weights in the house style of the existing hydrax tasks.
 
 `examples/panda_pregrasp.py` simulates deployment faithfully in both modes:
 plant integrated at 1 kHz, planner called at 25 Hz, and between planner
-updates the applied torque is `tau_ff + K(x_des − x_now)` with K ≡ 0 in
-feedforward mode. Feedforward and feedback runs share one loop and are
-directly comparable; the mode flag is the only difference.
+updates the applied torque is `tau_ff + Kp(q_des − q) + Kd(v_des − v)`. In
+**feedforward mode Kp/Kd are fixed joint-impedance gains** (LFC with
+constant gains — the low level, not the planner, stabilizes the
+open-loop-unstable arm, exactly as deployed; sync the values with the LFC
+config before Tier B). In feedback mode the F-MPPI gains take this role
+(how they combine with or replace the fixed gains is a Phase 3 design
+point). The torque-margin metric is computed on the *unclipped* command:
+a demand beyond the limits trips the real robot's reflexes rather than
+silently saturating. Runs are headless and record their trajectory;
+`--replay` plays a recorded run in the viewer with the reference plan as a
+transparent ghost robot (user decision: visualization is replay-based, not
+live).
 
 `FeedbackMPPI` extends `MPPI`:
 1. `sample_knots`: force sample 0 to zero noise (the warm-started nominal)
@@ -100,17 +110,40 @@ directly comparable; the mode flag is the only difference.
    `t₀ = state.time` by evaluating each sample's spline there — hydrax
    warm-starts by shifting knot *times*, not by index-rolling.
 
-## Starting parameters (from sbmpc's pregrasp config; Phase 3 retunes freely)
+## Parameters (tuned in the 2026-07-03 Phase 1 sweeps; Phase 3 retunes freely)
 
-| parameter | value |
-|-----------|-------|
-| plan horizon | 0.4 s (task `dt=0.04` × 10 steps) |
-| num_samples | 1024 |
-| temperature | 0.01 |
-| noise std | 0.01 × per-joint τ_max |
-| num_knots | 4, `spline_type="cubic"` |
-| gain batch | 128 |
-| reach duration | 7.5 s, `max_velocity_fraction` 0.20 |
+| parameter | value | note |
+|-----------|-------|------|
+| plan horizon | 0.4 s (task `dt=0.04` × 10 steps) | |
+| num_samples | 1024 | |
+| temperature | 0.01 | 0.002 destabilizes (sharp selection) |
+| noise std | **0.03 × per-joint τ_max** | per-joint, not scalar: 4.0 mm vs 10.3 mm terminal error at matched shoulder authority |
+| num_knots | 4, `spline_type="cubic"` | |
+| iterations | 1 | |
+| fixed impedance | Kp [1000,1000,1000,1000,20,10,5], Kd [5,5,5,5,2,2,1] | feedforward-mode low level; real LFC values (user, 2026-07-03) |
+| gain batch | 128 (Phase 2) | |
+| reach duration | 7.5 s, `max_velocity_fraction` 0.20 | |
+
+**Phase 1 findings (2026-07-03).** The torque-driven arm is open-loop
+unstable along the reach (errors e-fold ~0.2 s: a tau_ff-only replay on the
+1 kHz plant explodes by t≈3 s; Coulomb friction does not save it). Without
+a low-level stabilizer, MPPI's sampling noise doubles as the feedback
+authority and must be huge (0.12·τ_max reached only ~12 mm); with the
+deployment-realistic fixed-impedance low level, noise returns to small
+(0.03·τ_max) and V-A1 passes at 4.0 mm with 9 ms p95 solves. Per-joint
+noise remains necessary either way — the torque action space is
+heterogeneous (87 vs 12 Nm), unlike the G1 tasks whose position-servo
+actuators normalize the action space (which is why plain MPPI never needed
+it). The zero-noise nominal sample improves terminal error ~2×. Steepening
+the saturated cost destabilizes — the mocap-style cost stays untouched.
+MPC value-add over impedance-only: 4.0 mm vs 21 mm terminal error (measured
+with stiff placeholder wrists). With the **real LFC gains** (soft wrists,
+Kp 20/10/5) the terminal error is **9.9 mm — a marginal PASS** against the
+10 mm gate (run variance ±3 mm); joint 6 carries 29 mrad RMS, so the wrist
+burden falls on tau_ff — margin should come from Phase 2/3's MPPI gains
+(or, if needed sooner: iterations=2 or higher wrist noise_std).
+**V-A1: PASS** (latest report `validation/reports/V-A1_feedforward.json`,
+run log in `validation/reports/history.jsonl`).
 
 ---
 
@@ -124,9 +157,12 @@ robot. The A→B boundary is the attribution line: V-B2 runs the same scenario
 as V-A4(a), so any behavioral delta between them is ROS/transport/LFC, not
 the controller.
 
-Every check writes a report JSON to `validation/reports/` (metrics +
-pass/fail + git SHA + config hash) so gates are reproducible and comparable
-across runs.
+Every check writes a report JSON (metrics + pass/fail + git SHA + config)
+and a replayable trajectory recording to `validation/reports/`, under a
+**fixed name per check+mode — each run overwrites the last**, so artifacts
+never accumulate. The longitudinal record is `history.jsonl` (one compact
+line per run: date, SHA, verdict, key metrics). The directory is gitignored;
+milestone numbers that matter are quoted in this document.
 
 ### Tier A — in-hydrax (controller)
 
