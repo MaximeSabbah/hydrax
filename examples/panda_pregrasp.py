@@ -13,12 +13,8 @@ from mujoco import mjx
 
 from hydrax import ROOT
 from hydrax.algs import FeedbackMPPI
-from hydrax.tasks.panda_pregrasp import (
-    GOAL_POS,
-    TAU_MAX,
-    VEL_MAX,
-    PandaPregrasp,
-)
+from hydrax.configs import load_pregrasp_config
+from hydrax.tasks.panda_pregrasp import PandaPregrasp
 
 """
 Run the Panda pregrasp reach task.
@@ -30,10 +26,10 @@ applied torque follows the LFC law
     tau = tau_ff + Kp (q_des - q) + Kd (v_des - v)
 
 zero-order-held planner outputs between updates. In feedforward mode Kp/Kd
-are the fixed joint-impedance gains below (LFC with constant gains — the
-low-level loop, not the planner, stabilizes the open-loop-unstable arm,
-exactly as on the real robot). In feedback mode the F-MPPI gains take this
-role (plan Phase 2/3).
+are the fixed joint-impedance gains from the task options (LFC with
+constant gains — the low-level loop, not the planner, stabilizes the
+open-loop-unstable arm, exactly as on the real robot). In feedback mode the
+F-MPPI gains take this role (plan Phase 2/3).
 
 Runs are headless: the loop checks the V-A1/V-A4 gates from
 doc/feedback_mppi_panda_port_plan.md, writes a report JSON, and records the
@@ -41,11 +37,6 @@ trajectory next to it. Visualization is a replay: --replay opens the viewer
 and plays the recorded run, with the minimum-jerk reference shown as a
 transparent ghost robot (--show_reference).
 """
-
-# Fixed joint-impedance gains of the feedforward-mode low level.
-# NOTE: sync with the LFC configuration used on the robot before Tier B.
-KP_FIXED = np.array([1000.0, 1000.0, 1000.0, 1000.0, 20.0, 10.0, 5.0])
-KD_FIXED = np.array([5.0, 5.0, 5.0, 5.0, 2.0, 2.0, 1.0])
 
 REPORT_DIR = Path(__file__).parent.parent / "validation" / "reports"
 
@@ -161,22 +152,29 @@ if args.mode == "feedback":
         "feedback mode arrives with FeedbackMPPI (plan Phase 2/3)"
     )
 
-# Define the task (cost and dynamics)
-task = PandaPregrasp()
+# Define the task (cost and dynamics). The OCP tuning comes from the single
+# tuning surface, hydrax/configs/pregrasp.yaml — the same file the ROS
+# planner adapter loads, so this gate certifies what deploys.
+options, config = load_pregrasp_config()
+task = PandaPregrasp(options=options)
+tau_max = np.asarray(task.options.tau_max)
+vel_max = np.asarray(task.options.vel_max)
+goal_pos = np.asarray(task.options.goal_pos)
+kp_fixed = np.asarray(task.options.kp_fixed)
+kd_fixed = np.asarray(task.options.kd_fixed)
 
-# Set up the controller, warm-started from the feedforward torque plan.
-# Tuned in the 2026-07-03 Phase 1 sweeps, with the fixed-impedance low
-# level in the loop: per-joint noise (0.03 * tau_max) lets the wrists
-# refine at ~0.4 Nm while the shoulders explore at ~2.6 Nm — a scalar
-# noise cannot do both (measured 10.3 mm vs 4.0 mm terminal error).
+# Pair the controller with the task (the same glue exists in the ROS
+# planner adapter; V-B1 asserts the two stay equivalent), warm-started
+# from the feedforward torque plan.
 ctrl = FeedbackMPPI(
     task,
-    num_samples=1024,
-    noise_std=0.03 * TAU_MAX,
-    temperature=0.01,
-    plan_horizon=0.4,
-    spline_type="cubic",
-    num_knots=4,
+    num_samples=config.num_samples,
+    noise_std=config.noise_scale * tau_max,
+    temperature=config.temperature,
+    plan_horizon=config.plan_horizon,
+    spline_type=config.spline_type,
+    num_knots=config.num_knots,
+    iterations=config.iterations,
 )
 knot_times = np.linspace(0.0, ctrl.plan_horizon, ctrl.num_knots)
 knot_idx = np.minimum(
@@ -243,7 +241,7 @@ for k in range(n_steps):
         q_des, v_des = plan_q[i_ref], plan_v[i_ref]
         nan_seen |= not np.all(np.isfinite(tau_ff))
         if k % (steps_per_cycle * 25) == 0:
-            ee_err = np.linalg.norm(mj_data.site_xpos[site_id] - GOAL_POS)
+            ee_err = np.linalg.norm(mj_data.site_xpos[site_id] - goal_pos)
             print(
                 f"  t={t:5.1f}s  ee_err={ee_err:.4f} m  "
                 f"solve={solve_ms[-1]:.1f} ms",
@@ -257,20 +255,20 @@ for k in range(n_steps):
     # like the hardware.
     tau_cmd = (
         tau_ff
-        + KP_FIXED * (q_des - mj_data.qpos)
-        + KD_FIXED * (v_des - mj_data.qvel)
+        + kp_fixed * (q_des - mj_data.qpos)
+        + kd_fixed * (v_des - mj_data.qvel)
     )
     mj_data.ctrl[:] = tau_cmd
     mujoco.mj_step(mj_model, mj_data)
 
     q_hist[k + 1] = mj_data.qpos
     q_err_sq_sum += np.square(mj_data.qpos - plan_q[i_ref])
-    tau_frac_max = np.maximum(tau_frac_max, np.abs(tau_cmd) / TAU_MAX)
-    vel_frac_max = np.maximum(vel_frac_max, np.abs(mj_data.qvel) / VEL_MAX)
+    tau_frac_max = np.maximum(tau_frac_max, np.abs(tau_cmd) / tau_max)
+    vel_frac_max = np.maximum(vel_frac_max, np.abs(mj_data.qvel) / vel_max)
 
 # Metrics and gates
 mujoco.mj_forward(mj_model, mj_data)
-terminal_ee_err = float(np.linalg.norm(mj_data.site_xpos[site_id] - GOAL_POS))
+terminal_ee_err = float(np.linalg.norm(mj_data.site_xpos[site_id] - goal_pos))
 rms_q_err = np.sqrt(q_err_sq_sum / n_steps)
 steady = np.asarray(solve_ms[1:])
 gates = {

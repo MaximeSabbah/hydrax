@@ -11,13 +11,16 @@ backend behind the existing `sbmpc_ros` stack.
 |------|----------|
 | 2026-07-03 | **sbmpc results are not a reference — its implementation is.** No baseline fixtures, no parity comparisons against sbmpc runs; all validation gates are absolute and self-contained in hydrax. sbmpc remains the reference for *code*: the gain implementation, how the dynamics is wired, the 25 Hz control-loop timing structure, and solver parameter starting points. |
 | 2026-07-03 | **Cost functions are hydrax-native.** Written in the house style of the existing hydrax tasks (plain quadratics, O(1) weights); sbmpc's cost magnitudes are never copied — they belong to a differently normalized pipeline. |
-| 2026-07-03 | **Future (post-plan): an "optimizer" task mode** where MPPI finds its own trajectory from meta costs (e.g. end-effector pose), like sbmpc's optimizer fallback. Out of scope until trajectory tracking is validated; the task keeps its reference machinery separable so this mode can be added without a rewrite. |
+| 2026-07-03 | **Future (post-plan): an "optimizer" task mode** where MPPI finds its own trajectory from meta costs (e.g. end-effector pose), like sbmpc's optimizer fallback. Out of scope until trajectory tracking is validated; the task keeps its reference machinery separable so this mode can be added without a rewrite. Design record for it: the `references:` and `trajectory.horizon_reference: window\|constant` semantics in sbmpc's `ocp_configs/pregrasp.yaml` (that yaml is otherwise superseded — it remains only the tuning surface of the sbmpc fallback backend until Phase 6). |
 | 2026-07-03 | Port lives **in-tree in this hydrax fork** (`hydrax/algs/`, `hydrax/tasks/`, `examples/`), not a separate package. Upstream (`vincekurtz/hydrax`) stays a configured remote; rebase cost accepted. |
 | 2026-07-03 | **No bridge-side gain conditioning.** EMA filtering / norm clamping / `feedback_gain_scale` in the ROS bridge are rejected. K must come out of the optimizer deployable; gain quality is a solver-level requirement (Phase 3). |
 | 2026-07-03 | **Two-tier validation.** Tier A validates the controller entirely inside this repo (one example script + pytest, no ROS). Tier B validates the machinery through the `sbmpc_ros` launch with LFC. A phase may not enter Tier B until its Tier A checks pass. |
 | 2026-07-03 | **Single example script.** One `examples/panda_pregrasp.py` with `--mode feedforward\|feedback`; its simulation loop is always multi-rate (1 kHz plant / 25 Hz planner, planner outputs zero-order-held between updates) to mirror LFC exactly. No separate multirate script. |
 | 2026-07-03 | hydrax runs in its own **uv** environment (per hydrax README), not the sbmpc pixi env. How the Phase 4 bridge imports hydrax is decided at Phase 4. |
-| 2026-07-02 | `sbmpc_ros` stays **frozen** as the test harness until the hydrax planner is validated in sim (Phase 4 adds only a backend switch). The thin bridge rebuild (Phase 6) happens only after, per the consolidation plan in `sbmpc_ros/doc/`. |
+| 2026-07-03 | **Phase 1.5: early Tier B with the feedforward controller.** The validated V-A1 controller goes through the ROS/LFC machinery now (adapter + backend switch + V-B1/2/3), so integration unknowns are debugged with a trivial controller and the multi-rate LFC-law model is validated against the real LFC before Phase 3 tunes against it. Phases 2–3 then proceed hydrax-side; old Phase 4 shrinks to flipping the adapter to feedback mode + rerunning Tier B. |
+| 2026-07-03 | **The hydrax planner node runs in its own uv env** — hydrax is NOT installed into the sbmpc pixi env. A uv wrapper/supervisor mirrors the existing pixi one: ROS paths sourced, uv venv interpreter wins. |
+| 2026-07-03 | **Both backends coexist in sbmpc_ros until Phase 6** (default, final call deferred by user): sbmpc stays the robot-validated fallback and regression baseline; the backend switch is a launch argument per the consolidation plan, not deep dual plumbing. |
+| 2026-07-02 | `sbmpc_ros` stays **frozen** as the test harness until the hydrax planner is validated in sim (backend-switch integration adds only the adapter + launch path). The thin bridge rebuild (Phase 6) happens only after, per the consolidation plan in `sbmpc_ros/doc/`. |
 
 ## Goal
 
@@ -109,6 +112,76 @@ live).
 3. Control delta for the gain formula is taken at the **application time**
    `t₀ = state.time` by evaluating each sample's spline there — hydrax
    warm-starts by shifting knot *times*, not by index-rolling.
+
+## Parameter architecture (settled 2026-07-03; who sets what, concretely)
+
+**One tuning surface**: `hydrax/configs/pregrasp.yaml` holds the OCP tuning
+(cost weights, solver knobs, plan timing) — values in hydrax-native names.
+Both the Tier A example and the ROS planner adapter load it through the
+same `hydrax.configs.load_pregrasp_config()`, so the gates always certify
+exactly the file that deploys, and there is no promotion step: you tune
+the file, rerun a Tier A gate and/or relaunch the ROS sim, done. The ROS
+parameter layer carries **zero** tuning values (a guard test enforces it)
+— this keeps sbmpc's good idea (its yaml header: "the single tuning
+surface") while removing what broke it: nothing competes with or silently
+overrides the file, and the loader validates every key against the
+dataclass schema so typos fail loudly instead of being ignored.
+
+Two orthogonal launch axes: `backend:=mujoco|real` (where the plant is) and
+`planner:=hydrax|sbmpc` (which solver; **defaults to hydrax**, user
+decision 2026-07-03). All four combinations are valid. The `planner`
+argument drives everything it implies: the bridge preset yaml, the runtime
+wrapper (`uv_ros_run.sh` | `pixi_ros_run.sh`), and the node's
+`planner_impl` parameter.
+
+```
+hydrax/configs/pregrasp.yaml       THE tuning surface (values today;
+                                   see growth path below)
+hydrax/configs/__init__.py         load_pregrasp_config(): yaml → typed
+                                   dataclasses; unknown keys are an error
+hydrax/tasks/panda_pregrasp.py     PandaPregraspOptions (problem: costs,
+                                   goal, start, limits, kp/kd impedance,
+                                   DR) + PregraspControllerConfig (solver)
+                                   — the typed schema; defaults fill keys
+                                   the yaml omits; non-yaml fields (goal,
+                                   limits, impedance...) are code-only
+examples/panda_pregrasp.py         loads the yaml, pairs task+FeedbackMPPI
+                                   (the ~8-line glue hydrax examples always
+                                   contain); CLI flags are run modes only
+sbmpc_ros_bridge/
+  hydrax_planner_adapter.py        same loader + same pairing glue (V-B1
+                                   asserts equivalence); plan clock; mode
+                                   switch = which K is published
+  lfc_bridge_node.py               planner_impl param selects the adapter
+sbmpc_bringup/
+  launch/sbmpc_franka_bringup...   planner:=hydrax|sbmpc axis
+  config/hydrax_bridge.yaml        transport ONLY (topics, 25 Hz rate,
+                                   warmup, planner_impl, planner_mode)
+```
+
+**Growth path — the yaml becomes the OCP description (planned feature).**
+Today the file carries tuning values; the intent is to grow it into
+describing the OCP itself: selecting the task mode (tracking | optimizer)
+and composing **code-defined** cost terms with their weights, parameters
+and reference sources — what sbmpc's `running_terms`/`references` sections
+were reaching for. The invariants that keep it sane do not change as it
+grows: one file, schema-validated by the loader (every new yaml capability
+lands together with its schema and dataclass), nothing in the ROS layer can
+override it, and the cost terms themselves are implemented and reviewed as
+Python in the task — the yaml selects and parameterizes them, it never
+defines math.
+
+Worked examples of the flow:
+- *Try 2048 samples on the robot*: set `planner_num_samples: 2048` in
+  `hydrax_bridge.yaml`, relaunch. Code untouched, experiment recorded in
+  the preset.
+- *Make it the new default*: change `PregraspControllerConfig.num_samples`
+  in hydrax, rerun the Tier A gates, commit — every consumer (example,
+  adapter, tests) picks it up because all of them go through the factory.
+- *Move the goal pose*: `PandaPregraspOptions.goal_pos` — a problem change,
+  so it is a code change with a gate rerun, not a launch knob (individual
+  options get promoted to ROS params only when a deployment genuinely needs
+  to vary them).
 
 ## Parameters (tuned in the 2026-07-03 Phase 1 sweeps; Phase 3 retunes freely)
 
@@ -272,6 +345,38 @@ steady ~2 ms) ✅. Remaining: load + step the Panda scene in MJX.
 **Phase 1 — task + feedforward.** `PandaPregraspTask` (IK + min-jerk +
 inverse-dynamics references generated at construction) + plain hydrax `MPPI`,
 `panda_pregrasp.py` with the multi-rate loop (feedforward mode). Gate: V-A1.
+
+**Phase 1.5 — early Tier B (feedforward through ROS/LFC). COMPLETE
+(2026-07-05): V-B1 7/7, V-B2 PASS, V-B3 124/0.** The hydrax feedforward
+controller ran through the full `backend:=mujoco` bringup with LFC at
+1 kHz: EE error 11.3 mm at plan end converging to 1.4 mm after ~8 s of
+hold (0.1 mm floor in long holds), solve wall mean 10.6 / p95 12.7 ms,
+**0 deadline misses over 6,138 solves**, `validate_sbmpc_sim` verdict
+"stable", 400/400 planner outputs accepted. Tier A ↔ Tier B parity is
+essentially exact — torque margin 0.39 vs 0.39, velocity margin 0.14 vs
+0.14 — confirming the multi-rate Tier A loop is a faithful model of the
+deployed LFC law (the attribution line holds). Reports:
+`validation/reports/V-B2_feedforward.json`, replay `V-B2_replay.json`.
+Original step list:
+1. env spike: rclpy + hydrax + JAX-GPU importable in one uv-run process;
+2. uv wrapper/supervisor (mirroring the pixi one) + launch path;
+3. `HydraxPlannerAdapter` implementing the `PlannerOutput` surface
+   (tau_ff, q_des/v_des from the plan clock, and K — see mode switch below);
+4. V-B1 contract test (pure Python, no ROS runtime) — must pass before any
+   launch is touched;
+5. `backend:=mujoco` bringup → V-B2 parity against the V-A1 report; V-B3
+   regression suite.
+Gate: V-B1, V-B2, V-B3 (feedforward scope).
+
+*Where the feedforward/feedback switch lives:* in ONE place — the mode
+parameter of `HydraxPlannerAdapter` (mirroring sbmpc's `gain_mode` bridge
+parameter, selected by the same preset/launch argument). LFC always applies
+`tau = tau_ff + K(x_des − x_meas)` with whatever K arrives, and the bridge
+machinery is mode-agnostic; the mode only decides **which K the adapter
+publishes**: the constant impedance matrix (feedforward, Phase 1.5) or the
+FeedbackMPPI gains (feedback, Phase 4; whether they add to or replace the
+fixed impedance is settled in Phase 3). The Tier A example's `--mode` flag
+is the same switch in the same place — the K source, nothing else.
 
 **Phase 2 — FeedbackMPPI.** Implement the gain path. Gate: V-A2, timing.
 

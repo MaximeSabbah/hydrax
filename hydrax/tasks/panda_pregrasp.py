@@ -10,15 +10,6 @@ from mujoco import mjx
 from hydrax import ROOT
 from hydrax.task_base import Task
 
-HOME_Q = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785])
-TAU_MAX = np.array([87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0])
-VEL_MAX = np.array([2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61])
-
-# Pregrasp pose: 5 cm above the pick-and-place scene's object (top at z=0.05),
-# gripper pointing down with its x-axis along world x.
-GOAL_POS = np.array([0.5, 0.0, 0.10])
-GOAL_ROT = np.diag([1.0, -1.0, -1.0])
-
 
 @dataclass
 class PandaPregraspOptions:
@@ -36,14 +27,44 @@ class PandaPregraspOptions:
     # torque limits so the error is dimensionless
     control_cost_weight: float = 0.01
 
+    # --- Task geometry ---
+
+    # Pregrasp position: 5 cm above the pick-and-place scene's object
+    # (object top at z = 0.05)
+    goal_pos: Tuple[float, float, float] = (0.5, 0.0, 0.10)
+
+    # Pregrasp orientation (rotation matrix rows): gripper pointing down,
+    # x-axis along world x
+    goal_rot: Tuple[Tuple[float, float, float], ...] = (
+        (1.0, 0.0, 0.0),
+        (0.0, -1.0, 0.0),
+        (0.0, 0.0, -1.0),
+    )
+
+    # Joint configuration the reach starts from (the scene home keyframe)
+    start_q: Tuple[float, ...] = (0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785)
+
+    # --- Robot limits (Franka FER) ---
+
+    tau_max: Tuple[float, ...] = (87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0)
+    vel_max: Tuple[float, ...] = (2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61)
+
     # --- Reference plan ---
 
     # Nominal reach duration (s); stretched if the peak plan velocity would
-    # exceed max_velocity_fraction of the Franka velocity limits
+    # exceed max_velocity_fraction of the velocity limits
     duration_sec: float = 7.5
 
     # Cap on the plan's peak joint velocity, as a fraction of the limits
     max_velocity_fraction: float = 0.20
+
+    # --- Deployment low level (not used by the task's costs/dynamics) ---
+
+    # Fixed joint-impedance gains of the feedforward-mode 1 kHz law (LFC
+    # with constant gains). Real LFC configuration values; single source
+    # for the Tier A example loop and the ROS planner adapter.
+    kp_fixed: Tuple[float, ...] = (1000.0, 1000.0, 1000.0, 1000.0, 20.0, 10.0, 5.0)
+    kd_fixed: Tuple[float, ...] = (5.0, 5.0, 5.0, 5.0, 2.0, 2.0, 1.0)
 
     # --- Domain randomization ranges ---
 
@@ -63,6 +84,30 @@ class PandaPregraspOptions:
     actuator_gain_scale: float = 0.05
 
 
+@dataclass
+class PregraspControllerConfig:
+    """Solver configuration for the pregrasp reach.
+
+    Consumed by whoever pairs the task with its FeedbackMPPI controller
+    (the example script, the ROS planner adapter). This dataclass is the
+    typed schema for the ``solver:`` section of the single tuning surface,
+    ``configs/pregrasp.yaml`` (loaded via
+    ``hydrax.configs.load_pregrasp_config``); the defaults apply for keys
+    the yaml omits.
+    """
+
+    num_samples: int = 1024
+
+    # Per-joint sampling noise std = noise_scale * tau_max
+    noise_scale: float = 0.03
+
+    temperature: float = 0.01
+    plan_horizon: float = 0.4
+    spline_type: str = "cubic"
+    num_knots: int = 4
+    iterations: int = 1
+
+
 class PandaPregrasp(Task):
     """The Panda tracks a minimum-jerk joint plan to a pregrasp pose.
 
@@ -72,8 +117,8 @@ class PandaPregrasp(Task):
     per control step.
 
     All references are generated at construction, self-contained:
-      1. damped-least-squares IK gives the goal configuration for GOAL_POS /
-         GOAL_ROT,
+      1. damped-least-squares IK gives the goal configuration for the
+         pregrasp pose in the options,
       2. a quintic (minimum-jerk) joint plan runs from the start
          configuration to the goal,
       3. feedforward torques along the plan come from MuJoCo inverse
@@ -85,17 +130,16 @@ class PandaPregrasp(Task):
 
     def __init__(
         self,
-        start_q: np.ndarray = HOME_Q,
         impl: str = "jax",
         options: PandaPregraspOptions | None = None,
     ) -> None:
         """Load the MuJoCo model and build the reference plan.
 
         Args:
-            start_q: The joint configuration the reach starts from.
             impl: Backend to use for simulation rollouts ("jax" or "warp").
-            options: Task options controlling cost weights, the reference
-                     plan, and domain randomization ranges.
+            options: Task options controlling cost weights, the task
+                     geometry, the reference plan, and domain randomization
+                     ranges.
         """
         mj_model = mujoco.MjModel.from_xml_path(
             ROOT + "/models/panda/pregrasp.xml"
@@ -108,13 +152,18 @@ class PandaPregrasp(Task):
 
         # Reference plan: IK goal, then a quintic joint plan sampled at the
         # control period, then inverse-dynamics feedforward torques.
-        self.start_q = np.asarray(start_q, dtype=np.float64)
-        self.goal_q = self._solve_ik(GOAL_POS, GOAL_ROT, self.start_q)
+        self.start_q = np.asarray(options.start_q, dtype=np.float64)
+        vel_max = np.asarray(options.vel_max, dtype=np.float64)
+        self.goal_q = self._solve_ik(
+            np.asarray(options.goal_pos, dtype=np.float64),
+            np.asarray(options.goal_rot, dtype=np.float64),
+            self.start_q,
+        )
 
         # Stretch the duration if the quintic peak velocity (1.875*dq/T)
         # would exceed the requested fraction of the velocity limits.
         dq = np.abs(self.goal_q - self.start_q)
-        t_vel = 1.875 * np.max(dq / (options.max_velocity_fraction * VEL_MAX))
+        t_vel = 1.875 * np.max(dq / (options.max_velocity_fraction * vel_max))
         self.duration = max(options.duration_sec, float(t_vel))
 
         q_plan, v_plan, a_plan = self._min_jerk_plan(
@@ -127,7 +176,7 @@ class PandaPregrasp(Task):
         self.reference_qpos = jnp.array(q_plan, dtype=jnp.float32)
         self.reference_qvel = jnp.array(v_plan, dtype=jnp.float32)
         self.reference_ctrl = jnp.array(tau_plan, dtype=jnp.float32)
-        self.tau_max = jnp.array(TAU_MAX, dtype=jnp.float32)
+        self.tau_max = jnp.array(options.tau_max, dtype=jnp.float32)
 
         # Weigh different cost terms, then normalize so all terms add to 1.
         total_weights = (
@@ -199,6 +248,7 @@ class PandaPregrasp(Task):
         self, q: np.ndarray, v: np.ndarray, a: np.ndarray
     ) -> np.ndarray:
         """Feedforward torque along the plan via mj_inverse (contact-free)."""
+        tau_max = np.asarray(self.options.tau_max, dtype=np.float64)
         data = mujoco.MjData(self.mj_model)
         tau = np.zeros_like(q)
         for k in range(q.shape[0]):
@@ -207,7 +257,7 @@ class PandaPregrasp(Task):
             data.qacc[:] = a[k]
             mujoco.mj_inverse(self.mj_model, data)
             tau[k] = data.qfrc_inverse
-        return np.clip(tau, -TAU_MAX, TAU_MAX)
+        return np.clip(tau, -tau_max, tau_max)
 
     def _get_reference_configuration(self, t: jax.Array) -> jax.Array:
         """Get the reference position (q) at time t."""

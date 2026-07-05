@@ -1,0 +1,31 @@
+# Pregrasp OCP tuning — THE single tuning surface for the Tier A gates,
+# the ROS simulation, and the real robot (all consumers load this file
+# through hydrax.tasks.panda_pregrasp.load_pregrasp_config; nothing can
+# override it from the ROS parameter layer).
+#
+# Values only: cost functions and everything not listed here (goal pose,
+# robot limits, impedance law, domain randomization) are code, in
+# PandaPregraspOptions / PregraspControllerConfig, and changing them is a
+# reviewed code change. Unknown keys in this file are an error.
+#
+# The committed values are the configuration certified by the Tier A gates
+# (doc/feedback_mppi_panda_port_plan.md). Tune freely for experiments —
+# both the Tier A example and the ROS bringup read the same file — and
+# rerun the gates before trusting a changed value.
+
+costs:
+  configuration_weight: 1.0
+  velocity_weight: 0.1
+  control_weight: 0.01
+
+solver:
+  num_samples: 1024
+  noise_scale: 0.03 # sampling std = noise_scale * tau_max, per joint
+  temperature: 0.01
+  num_knots: 4
+  plan_horizon: 0.4 # seconds
+  iterations: 1
+
+plan:
+  duration_sec: 7.5
+  max_velocity_fraction: 0.20
