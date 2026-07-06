@@ -107,6 +107,11 @@ class PregraspControllerConfig:
     num_knots: int = 4
     iterations: int = 1
 
+    # Feedback-gain batch: the zero-noise nominal + the lowest-cost samples
+    # used for K = du*/dx0. Only consumed when the pairing glue enables the
+    # gain computation (feedback mode).
+    num_gain_samples: int = 128
+
 
 class PandaPregrasp(Task):
     """The Panda tracks a minimum-jerk joint plan to a pregrasp pose.

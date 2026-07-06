@@ -171,6 +171,7 @@ ctrl = FeedbackMPPI(
     num_samples=config.num_samples,
     noise_std=config.noise_scale * tau_max,
     temperature=config.temperature,
+    num_gain_samples=config.num_gain_samples,
     plan_horizon=config.plan_horizon,
     spline_type=config.spline_type,
     num_knots=config.num_knots,

@@ -34,6 +34,7 @@ _PREGRASP_YAML_SCHEMA = {
         "num_knots": ("config", "num_knots"),
         "plan_horizon": ("config", "plan_horizon"),
         "iterations": ("config", "iterations"),
+        "num_gain_samples": ("config", "num_gain_samples"),
     },
     "plan": {
         "duration_sec": ("options", "duration_sec"),

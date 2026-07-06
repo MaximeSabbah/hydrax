@@ -25,6 +25,7 @@ solver:
   num_knots: 4
   plan_horizon: 0.4 # seconds
   iterations: 1
+  num_gain_samples: 128 # gain batch: zero-noise nominal + lowest-cost samples
 
 plan:
   duration_sec: 7.5

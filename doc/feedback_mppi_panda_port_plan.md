@@ -9,6 +9,7 @@ backend behind the existing `sbmpc_ros` stack.
 
 | Date | Decision |
 |------|----------|
+| 2026-07-06 | **`FeedbackMPPI` is a self-contained `SamplingBasedController` subclass** (user direction): every alg in `hydrax/algs` derives from the base directly, so the F-MPPI file carries its own (deliberately MPPI-identical) update, and the gain code mirrors sbmpc's `gains.py`/`solvers.py` structure so the two implementations stay diff-able. |
 | 2026-07-03 | **sbmpc results are not a reference — its implementation is.** No baseline fixtures, no parity comparisons against sbmpc runs; all validation gates are absolute and self-contained in hydrax. sbmpc remains the reference for *code*: the gain implementation, how the dynamics is wired, the 25 Hz control-loop timing structure, and solver parameter starting points. |
 | 2026-07-03 | **Cost functions are hydrax-native.** Written in the house style of the existing hydrax tasks (plain quadratics, O(1) weights); sbmpc's cost magnitudes are never copied — they belong to a differently normalized pipeline. |
 | 2026-07-03 | **Future (post-plan): an "optimizer" task mode** where MPPI finds its own trajectory from meta costs (e.g. end-effector pose), like sbmpc's optimizer fallback. Out of scope until trajectory tracking is validated; the task keeps its reference machinery separable so this mode can be added without a rewrite. Design record for it: the `references:` and `trajectory.horizon_reference: window\|constant` semantics in sbmpc's `ocp_configs/pregrasp.yaml` (that yaml is otherwise superseded — it remains only the tuning surface of the sbmpc fallback backend until Phase 6). |
@@ -100,7 +101,9 @@ silently saturating. Runs are headless and record their trajectory;
 transparent ghost robot (user decision: visualization is replay-based, not
 live).
 
-`FeedbackMPPI` extends `MPPI`:
+`FeedbackMPPI` (self-contained `SamplingBasedController` subclass, house
+pattern of `hydrax/algs`; the policy update is deliberately identical to
+`MPPI`'s):
 1. `sample_knots`: force sample 0 to zero noise (the warm-started nominal)
    and use **per-joint** noise std (scale × torque limit
    [87,87,87,87,12,12,12]; hydrax's scalar `noise_level` cannot express this).
@@ -378,7 +381,22 @@ FeedbackMPPI gains (feedback, Phase 4; whether they add to or replace the
 fixed impedance is settled in Phase 3). The Tier A example's `--mode` flag
 is the same switch in the same place — the K source, nothing else.
 
-**Phase 2 — FeedbackMPPI.** Implement the gain path. Gate: V-A2, timing.
+**Phase 2 — FeedbackMPPI. COMPLETE (2026-07-06): V-A2 PASS, timing PASS.**
+Gain path implemented (`compute_gains=True` → K in `params.gains`;
+`num_gain_samples` joined the tuning surface). FD relative Frobenius
+error: (a) toy 0.020 % / (b) Panda fresh 0.121 % / (c) warm mid-reach
+0.118 % against tolerances 1/2/10 %. Cycle-with-gains at the deployment
+config (1024 samples, gain batch 128): mean 21.1 ms, p95 22.6 ms against
+the 40 ms budget. Warm-started ‖K‖_F ≈ 23 with fresh ≈ 23 — none of
+sbmpc's 0↔2465 flapping, consistent with the O(1) normalized costs
+removing the degeneracy driver at the source (V-A3 quantifies in
+Phase 3). Finding: jvp tangents through MJX **joint-limit constraint
+rows** can go NaN even far from the limit (an MJX differentiability
+quirk, control-value dependent — V-A2(a) therefore tests the formula
+with the toy's limits disabled). The pregrasp model is constraint-free
+by design: 0/1024 non-finite gradients measured; the nan_to_num guard
+inherited from sbmpc covers stray cases, and the non-finite-gradient
+count is a candidate V-A3 health metric (to ratify in Phase 3).
 
 **Phase 3 — gain quality at the source (user direction).** Make K deployable
 from the optimizer, no downstream conditioning. Levers: cost normalization,
@@ -406,6 +424,8 @@ tests. V-B2/V-B3 rerun as the regression net for the rebuild.
   physics) may blow the 40 ms budget (14 tangents × 128 gain rollouts).
   Mitigations: the pregrasp reach is contact-free → disable contacts in the
   planning model; reduce gain batch; measured at the Phase 2 gate.
+  **Resolved 2026-07-06: p95 22.6 ms at the deployment config — within
+  budget with ~17 ms headroom.**
 - **R2 — softmax degeneracy persists.** If the Phase 3 levers can't satisfy
   V-A3 + V-A4, the fallback is feedforward deployment while Phase 3
   continues — not bridge conditioning.
