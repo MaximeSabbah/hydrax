@@ -4,9 +4,9 @@
 # override it from the ROS parameter layer).
 #
 # Values only: cost functions and everything not listed here (goal pose,
-# robot limits, impedance law, domain randomization) are code, in
-# PandaPregraspOptions / PregraspControllerConfig, and changing them is a
-# reviewed code change. Unknown keys in this file are an error.
+# robot limits, domain randomization) are code, in PandaPregraspOptions /
+# PregraspControllerConfig, and changing them is a reviewed code change.
+# Unknown keys in this file are an error.
 #
 # The committed values are the configuration certified by the Tier A gates
 # (doc/feedback_mppi_panda_port_plan.md). Tune freely for experiments —
@@ -24,6 +24,7 @@ solver:
   temperature: 0.007
   mean_adaptation_rate: 1.0 # <1 damps the hold jitter (partial mean update)
   num_knots: 4
+  spline_type: linear # knot interpolation: zero, linear or cubic (gains need knot-linearity); linear measured calmer at the hold than cubic
   plan_horizon: 0.32 # seconds (8 steps; H is the sequential depth of both the sampling and the gain path)
   iterations: 3
   num_gain_samples: 128 # gain batch: zero-noise nominal + lowest-cost samples
@@ -31,3 +32,10 @@ solver:
 plan:
   duration_sec: 7.5
   max_velocity_fraction: 0.20
+
+# The feedforward-mode low level: per-joint impedance published to LFC as
+# K = -[diag(kp) | diag(kd)], anchored on the plan reference. Values from
+# the real LFC configuration. Not used in exact_feedback mode.
+feedforward:
+  kp: [1000.0, 1000.0, 1000.0, 1000.0, 20.0, 10.0, 5.0]
+  kd: [5.0, 5.0, 5.0, 5.0, 2.0, 2.0, 1.0]

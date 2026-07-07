@@ -508,7 +508,17 @@ User confirmed both findings in their own viewer run. Measured fixes:
   best measured point on every axis simultaneously.
 - **Frozen config**: T=0.007, plan_horizon=0.32, iterations=3,
   1024 samples, gain batch 128, noise 0.03·τ_max, weights 1.0/0.1/0.01,
-  mean_adaptation_rate 1.0. Full re-gate at this config: V-A1
+  mean_adaptation_rate 1.0, **spline_type=linear** (user choice
+  2026-07-07 after the spline probe: linear is measurably calmer than
+  cubic at the hold — no interpolation overshoot between noisy knots —
+  wander span 0.0159 vs 0.0184 rad, hold q̇ RMS 0.0218 vs 0.0267;
+  terminal 9.9 vs 7.5 mm, both under the 10 mm gate; "zero" fails
+  terminal at 18 mm. Re-gated at linear: V-A1 ff 0.77 mm / wander
+  0.006; V-A4 nominal 9.9 mm, ESS 94, scenarios all stable ESS 92–96;
+  V-A2 4/4 FD ≤ 0.21 %, cycle 29.6/31.4 ms; V-B1 10/10; **V-B2
+  0 deadline misses / 946 solves, mean 30.3 / p95 32.1 ms, hold q̇ RMS
+  0.0225** — every axis equal or better than cubic except the 2 mm of
+  terminal). Earlier full re-gate at the cubic variant: V-A1
   (feedforward baseline 1.6 mm), V-A2 4/4 (FD 0.02–0.16 %; the FD cases
   certify the formula at iterations=1, the deployed K is the
   final-iteration gain per the Phase 3 decision), V-A4 scenarios all

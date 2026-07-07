@@ -62,7 +62,8 @@ class PandaPregraspOptions:
 
     # Fixed joint-impedance gains of the feedforward-mode 1 kHz law (LFC
     # with constant gains). Real LFC configuration values; single source
-    # for the Tier A example loop and the ROS planner adapter.
+    # for the Tier A example loop and the ROS planner adapter. Set by the
+    # `feedforward:` section of the tuning yaml.
     kp_fixed: Tuple[float, ...] = (1000.0, 1000.0, 1000.0, 1000.0, 20.0, 10.0, 5.0)
     kd_fixed: Tuple[float, ...] = (5.0, 5.0, 5.0, 5.0, 2.0, 2.0, 1.0)
 

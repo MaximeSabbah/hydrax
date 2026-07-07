@@ -33,6 +33,7 @@ _PREGRASP_YAML_SCHEMA = {
         "temperature": ("config", "temperature"),
         "mean_adaptation_rate": ("config", "mean_adaptation_rate"),
         "num_knots": ("config", "num_knots"),
+        "spline_type": ("config", "spline_type"),
         "plan_horizon": ("config", "plan_horizon"),
         "iterations": ("config", "iterations"),
         "num_gain_samples": ("config", "num_gain_samples"),
@@ -40,6 +41,10 @@ _PREGRASP_YAML_SCHEMA = {
     "plan": {
         "duration_sec": ("options", "duration_sec"),
         "max_velocity_fraction": ("options", "max_velocity_fraction"),
+    },
+    "feedforward": {
+        "kp": ("options", "kp_fixed"),
+        "kd": ("options", "kd_fixed"),
     },
 }
 

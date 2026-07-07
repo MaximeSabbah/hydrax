@@ -161,6 +161,16 @@ class FeedbackMPPI(SamplingBasedController):
                 f"num_gain_samples ({num_gain_samples}) must be in "
                 f"[1, num_samples] ([1, {num_samples}])"
             )
+        if compute_gains and spline_type == "akima":
+            # Upstream hydrax's spline utility also offers "akima"
+            # (hydrax/utils/spline.py), whose knot tangents are ratios of
+            # knot-value differences — NOT linear in the knots. The gain
+            # formula relies on u*(t0) = sum_b w_b u_b(t0), which needs
+            # that linearity, so K would be silently wrong.
+            raise ValueError(
+                "feedback gains require a knot-linear spline "
+                "(zero, linear or cubic — not akima)"
+            )
         if compute_gains and self.num_randomizations > 1:
             # The gains differentiate one model's rollout cost; du*/dx₀ of
             # a risk-combined cost over randomized models is not defined
