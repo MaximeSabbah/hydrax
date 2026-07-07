@@ -405,11 +405,91 @@ degeneracy), gain-batch size, knot count. Wire `--mode feedback` + scenario
 flags into the example. Gate: V-A3, V-A4. Freeze the tuned config as
 canonical before Tier B.
 
+*Phase 3 status (2026-07-06) — feedback mode implemented and measured;
+BLOCKED on design decisions (below).* The feedback law is the paper's pure
+replacement `tau = tau_ff + K (x − x₀)`, x₀ = the state the plan was
+solved from (user decision; K's anchor is the linearization point, not
+the tracking reference — anchoring at the reference double-counts the
+tracking error already baked into tau_ff). Solver exposes the V-A3
+readouts (`gain_ess`, `gain_nominal_weight`); the example implements the
+V-A4 scenarios and evaluates the V-A3 gates on the applied K series.
+Retune campaign over 12 configs (temperature 0.002–0.01 × iterations 1–3
+× noise 0.02/0.03 × knots 4/6 × samples 1024/2048 × weight rebalance ×
+saturated-vs-quadratic cost). Frozen candidate: **T=0.007,
+iterations=3** (in the yaml). Findings, all measured:
+1. The retune helps FEEDFORWARD dramatically: terminal 9.9 → **2.3 mm**,
+   mean RMS 6.8 → 2.6 mrad, wrist RMS 29 → 7 mrad (new V-A1 baseline).
+2. Pure-replacement feedback is **stable everywhere** (all margins, no
+   NaN, latency 0.04 s tolerated — the historical robot killer; mass
+   ±10 % stable) with healthy gains (ESS ≥ 32, nominal never dominant,
+   ‖K‖_F ≈ 15–35, no flapping), terminal 5.9 mm — but it is dominated
+   by the retuned feedforward on every tracking metric: nominal RMS
+   15.4 vs 2.6 mrad (moving-reference lag ∝ reference speed, converges
+   during hold), disturbance peak 0.101 vs 0.024 rad (V-A4(b) fails 4×
+   the wrong way), mass-0.9 sag 95 vs 4 mrad.
+3. Structural cause: at a healthy softmax the deployable K is O(10–30)
+   N·m/rad — it cannot match a Kp≈1000 impedance's rejection;
+   sharpening temperature to chase stiffness collapses ESS to 1–13 and
+   reproduces sbmpc's degeneracy (controlled demonstration of the same
+   disease). Cost shape is NOT a lever: saturated vs plain quadratic is
+   identical at tracking error scales (diagnostic run, reverted).
+4. **V-A2 × iterations tension:** the gain formula is exact only at
+   iterations=1; at the frozen it=3 config the FD error is 43 %/78 %
+   (fresh/warm) — the formula covers only the final iteration's update.
+   Candidate fix to evaluate: per-iteration gain summation
+   (K ≈ Σ_iters K_i, leading-order chain), gated by the same FD test;
+   costs ~3× the gain compute.
+5. Cycle-with-gains at it=3: 37.0 / 38.9 ms (mean/p95, under partial
+   GPU contention) — fits the 40 ms budget.
+6. Gate calibration issues found: `health_k_smoothness` fails in every
+   run at small K (ΔK ≈ 0.3–1.5 × ‖K‖ per solve, but the torque step
+   ΔK·(x−x₀) ~ 0.01 N·m — the gate should bound the applied-torque
+   discontinuity, not relative ΔK); V-A4(a)'s mean-RMS comparator
+   structurally favors the 1 kHz stiff impedance (user goal is terminal
+   precision).
+*Pending user decisions:* deployment law for feedback mode (additive
+impedance+K — empirically motivated now — vs feedforward-only fallback
+per R2 vs keep pure and re-scope gates); V-A4(a)/(b) comparators; V-A3
+smoothness recalibration; the iterations×gains resolution.
+
 **Phase 4 — ROS integration.** `HydraxPlannerAdapter` implementing the
 duck-typed surface `SbMpcPlannerAdapter` consumes today, selected by a
 backend switch (lands on the consolidation-plan launch structure);
 `sbmpc_ros` otherwise unmodified. Decide here how the bridge env imports
 hydrax (uv env vs install into pixi). Gate: V-B1, V-B2, V-B3.
+
+*Phase 4 status (2026-07-06) — exact_feedback deployed through ROS/LFC
+in sim.* User direction: deploy feedback despite the Phase 3 tracking
+gap — the future optimizer mode has no reference trajectory, so the
+F-MPPI law is the only viable low level there; interim performance
+accepted. Implemented: adapter `exact_feedback` mode (K =
+`FeedbackMPPIParams.gains` in du/dx convention; `gain_ess` /
+`gain_nominal_weight` in diagnostics; `compute_gains` only in this
+mode), anchor semantics ride the existing machinery — the bridge's
+reference substitution is feedforward-gated, so `control.initial_state`
+stays the measured solve state x₀ and LFC applies
+`tau_ff + K (x − x₀)`. **The mode switch is `hydrax_bridge.yaml`'s
+`planner_mode` (user decision: preset yaml, no launch argument; the
+install space must be rebuilt after editing it).** V-B1 10/10 (new
+contract tests: solver gains published, K_lfc = −K, x₀ anchor
+round-trip); guard tests updated (preset pins exact_feedback); V-B3
+124/0. **V-B2 (exact_feedback, backend:=mujoco): functionally clean** —
+armed after warmup, full reach converged (task error min 2.8 mm),
+1917/1917 outputs accepted, no watchdog trips, ‖K‖ 9–27 flowing
+end-to-end. Two deployment findings:
+1. **25 Hz deadline: no headroom.** Cycle mean 38.8 / p95 41.2 ms →
+   ~24 % deadline misses (an external process held the GPU at 60–100 %
+   throughout — timing polluted, but the margin is structurally ~zero
+   at iterations=3). Mitigations to choose after a free-GPU
+   re-measurement: iterations 3→2 (~31 ms, terminal 8.1 mm),
+   num_gain_samples 128→96/64, jit get_action (−0.4 ms).
+2. **Hold-phase wander.** With the reference static, the pure law has
+   no position anchor: task error oscillates 2.8→23 mm during the hold
+   (tail joint spans ≈ 0.04 rad, joint-velocity RMS 0.044) — the arm
+   random-walks on solver sampling noise restrained only by the weak
+   K-spring. Visible at the pregrasp pose on the robot; options: accept
+   (research mode), a phase machine that switches mode after the reach
+   (future planner-side work), or revisiting the law.
 
 **Phase 5 — robot.** Gate: V-B4; definition of done.
 

@@ -21,10 +21,10 @@ costs:
 solver:
   num_samples: 1024
   noise_scale: 0.03 # sampling std = noise_scale * tau_max, per joint
-  temperature: 0.01
+  temperature: 0.007
   num_knots: 4
   plan_horizon: 0.4 # seconds
-  iterations: 1
+  iterations: 3
   num_gain_samples: 128 # gain batch: zero-noise nominal + lowest-cost samples
 
 plan:

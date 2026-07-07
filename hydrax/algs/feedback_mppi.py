@@ -24,9 +24,26 @@ class FeedbackMPPIParams(SamplingParams):
         gains: K = du*/dx₀ from the last optimize call, shape (nu, nq + nv).
                Zero before the first solve, and always zero when the
                controller was built with ``compute_gains=False``.
+        gain_ess: Effective sample size ESS = 1/Σᵢwᵢ² of the softmax
+                  weights over the gain batch in the last solve: how many
+                  rollouts K is effectively averaging over (≈ batch size
+                  when the weights are spread, ≈ 1 when one sample takes
+                  all the weight). The V-A3 readout of softmax degeneracy
+                  — F-MPPI gains are only trustworthy when several samples
+                  share the weight. Zero until gains are computed.
+        gain_nominal_weight: Softmax weight of the zero-noise nominal
+                             (sample 0) within the gain batch. The
+                             measured sbmpc failure mode was the nominal
+                             winning the softmax (weight ≈ 1 ⇒ K ≈ 0,
+                             spiking when a fluke sample beats it), so
+                             this is its direct fingerprint (V-A3 bounds
+                             how often it exceeds 0.5). Zero until gains
+                             are computed.
     """
 
     gains: jax.Array
+    gain_ess: jax.Array
+    gain_nominal_weight: jax.Array
 
 
 class FeedbackMPPI(SamplingBasedController):
@@ -56,11 +73,17 @@ class FeedbackMPPI(SamplingBasedController):
     - **Feedback gains** (``compute_gains=True``): each solve also returns
       K = du*/dx₀, the sensitivity of the first applied control to the
       initial state, in ``params.gains`` — the Feedback-MPPI gain, for a
-      1 kHz low level applying ``tau = u* + K (x − x_des)`` between 25 Hz
-      planner updates. The default is False: the feedforward deployment
-      mode uses the sampling improvements only and pays nothing for the
-      gain path (the mode switch lives in the pairing glue — the example
-      script and the ROS planner adapter).
+      1 kHz low level applying ``tau = u* + K (x − x₀)`` between 25 Hz
+      planner updates, where x₀ is the state the plan was solved from
+      (NOT the tracking reference: the planner already responded to the
+      tracking error when it solved from x₀, so K multiplies only the
+      drift since planning — the linearized re-solve). In feedback mode
+      this law fully replaces the fixed joint impedance (user decision
+      2026-07-06): K is the local optimal feedback and must be deployable
+      straight from the solver. The default is False: the feedforward
+      deployment mode uses the sampling improvements only and pays
+      nothing for the gain path (the mode switch lives in the pairing
+      glue — the example script and the ROS planner adapter).
     """
 
     def __init__(
@@ -144,6 +167,8 @@ class FeedbackMPPI(SamplingBasedController):
             mean=_params.mean,
             rng=_params.rng,
             gains=jnp.zeros((self.task.model.nu, nx)),
+            gain_ess=jnp.zeros(()),
+            gain_nominal_weight=jnp.zeros(()),
         )
 
     def sample_knots(
@@ -179,15 +204,22 @@ class FeedbackMPPI(SamplingBasedController):
         """Optimize as usual, then compute the gains from the same rollouts."""
         params, rollouts = super().optimize(state, params)
         if self.compute_gains:
+            gains, ess, nominal_weight = self._compute_gains(state, rollouts)
             params = params.replace(
-                gains=self._compute_gains(state, rollouts)
+                gains=gains,
+                gain_ess=ess,
+                gain_nominal_weight=nominal_weight,
             )
         return params, rollouts
 
     def _compute_gains(
         self, state: mjx.Data, rollouts: Trajectory
-    ) -> jax.Array:
+    ) -> Tuple[jax.Array, jax.Array, jax.Array]:
         """K = du*/dx₀: sensitivity of the first applied control to the state.
+
+        Returns (K, ESS, nominal weight); the last two are the V-A3
+        health readouts of exactly the softmax weights the gains used
+        (see FeedbackMPPIParams).
 
         The F-MPPI gain, mirroring the sbmpc reference implementation
         (``gains.py::MPPIGain.gains_computation`` + the gain path of
@@ -241,7 +273,8 @@ class FeedbackMPPI(SamplingBasedController):
             / self.temperature
         )
         gains = jnp.einsum("bi,bo->oi", weights_grad, samples_delta)
-        return jnp.nan_to_num(gains)
+        ess = 1.0 / jnp.sum(jnp.square(weights))
+        return jnp.nan_to_num(gains), ess, weights[0]
 
     def _rollout_cost_gradient(
         self, state: mjx.Data, controls: jax.Array

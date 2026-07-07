@@ -298,7 +298,10 @@ class PandaPregrasp(Task):
         u_err = (control - u_ref) / self.tau_max  # size (nu,)
 
         # Tracking costs J = 1 - exp(-|error|^2) for each error term. This
-        # puts each error term between 0 and 1.
+        # puts each error term between 0 and 1. (Phase 3 diagnostic, kept
+        # for the record: plain quadratic terms give the same tracking to
+        # within run noise — the two are identical at small errors — so
+        # the saturated form is kept for its bounded scale.)
         q_squared_error = jnp.sum(jnp.square(q_err))
         q_cost = 1.0 - jnp.exp(-q_squared_error)
 
