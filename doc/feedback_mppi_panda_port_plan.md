@@ -290,6 +290,73 @@ Phase 3 gate — same script and loop as V-A1, only the mode flag differs):
 - (e) V-A3 health bounds recomputed on the K actually applied in (a)–(d) —
   they must hold in closed loop, not just along a nominal run.
 
+**V-A5 — initial-configuration robustness** (`panda_pregrasp_q0_sweep.py`,
+pre-robot gate, added 2026-07-07). On the real robot the arm is hand-placed
+near — not at — the home pose before each session, but the min-jerk
+reference plan always starts at the hardcoded `start_q`: the adapter builds
+the task once at startup and never re-seeds the plan from the measured
+state (`step()` does solve from the measured state — only the reference
+anchor is fixed). The sweep starts the PLANT from perturbed configurations
+(uniform per-joint offsets, default 0.05/0.1/0.2 rad × 8 seeds, clipped
+clear of the joint limits) while the reference stays nominal, driving
+`panda_pregrasp.py --q0_noise MAG --q0_seed K` one process per run. Pass,
+per run:
+- the full per-run gate set (margins, no-NaN, solve timing, gain health in
+  feedback mode) minus the gates that already fail on the certified nominal
+  report — those are known-moot at the frozen config (`health_k_smoothness`:
+  the K estimate is sample-noisy step to step, identical value on nominal
+  and perturbed runs) and carry no robustness signal;
+- landing: terminal EE error ≤ 15 mm (the 10 mm nominal gate widened by the
+  hold-wander spread — the terminal error is one draw from the hold jitter
+  and the nominal run already sits at 9.9 mm) and hold q̇ RMS ≤ 0.05 rad/s.
+
+Both modes are swept. Feedforward's fixed impedance servos the reference
+from t = 0, so a hand-placed offset produces an immediate `kp·Δq` torque
+demand at arming — the feedforward sweep quantifies how much offset the
+flip-back mode tolerates before the torque margin (or the real robot's
+reflexes) trips. Failing runs keep their report + trajectory for `--replay`;
+the aggregate grid lands in `validation/reports/V-A5_q0_robustness_<mode>.json`.
+
+**Results (2026-07-07, frozen linear-spline config):**
+- *feedback (exact_feedback, the deployed mode): 24/24 PASS.* Placement
+  offsets up to ±0.2 rad/joint (offset norms 0.06–0.36 rad) are absorbed
+  within the reach: every run lands at 9.9 mm and settles at hold q̇ RMS
+  ≤ 0.022. The closed loop is strongly contracting — perturbed starts
+  converge onto the nominal trajectory before the mid-reach peaks, so the
+  run maxima match nominal to print precision (worst τ fraction 0.378 =
+  the nominal value at every magnitude; only the velocity peak shows the
+  transient at ±0.2, 0.15 → 0.29, still under the 0.80 gate). ESS min
+  94 everywhere; no NaN; solve timing unchanged. Mechanism: the solver
+  re-plans from the measured state every cycle and the placement error
+  decays over the first ~5 s of the reach (smoke trace: EE error rejoins
+  the nominal tube by t ≈ 6 s at ±0.1 rad).
+- *feedforward (the flip-back mode): 6/8 PASS at ±0.05, 1/8 at ±0.1, 0/8
+  at ±0.2 rad — aggregate FAIL, by design a tolerance measurement.* The
+  fixed impedance demands `kp·Δq` at arming: worst commanded demand 2.5×
+  τ_max and 3.2× the velocity limit at ±0.2 rad (in sim the actuators
+  clamp and the run still lands at 0.8 mm; on the real robot this trips
+  the reflexes). Deployment rule derived: **only arm feedforward mode
+  with the arm parked at the home pose**; hand placement is certified for
+  exact_feedback only. Recorded in the README robot protocol (Step 4).
+
+*Tier B counterpart (2026-07-07, user-requested): `initial_q:=home|random`
+launch argument*, sim-only, for watching the placement gap absorbed live.
+`random` regenerates the scene's `home` keyframe through the planner
+runtime (`sbmpc_bringup/initial_q.py`): qpos drawn fresh each launch
+within the certified ±0.2 rad envelope (clipped clear of joint limits)
+AND the keyframe's gravity-compensation ctrl recomputed at the drawn pose
+(it holds the arm before the LFC stack activates — a moved qpos with the
+home ctrl would sag). The generated scene is written next to the
+install-space original (relative include/assets resolve unchanged,
+gitignored) and reaches the sim via the xacro `mujoco_model` override;
+`initial_keyframe` and the post-warmup ResetWorld still say `home`, so no
+other wiring moves. The draw is logged at launch. Verified end-to-end
+headless: sim loaded the generated scene, armed, reach completed from a
+draw with offsets to 0.19 rad — 0 deadline misses / 3304 solves, planning
+30.5/32.4 ms, task error min 1.7 mm, gains 9–21, 2697/2697 accepted (same
+numbers as the nominal V-B2 run). Unit tests `test_initial_q.py` 4/4;
+launch argument-surface guard updated (ten arguments).
+
 ### Tier B — through sbmpc_ros (machinery)
 
 **V-B1 — adapter contract, no ROS runtime** (pytest in `sbmpc_ros`, pattern of
@@ -334,7 +401,7 @@ recorded with the existing replay tooling):
 | 2 | V-A2 (a–c), cycle-with-gains ≤ 40 ms |
 | 3 | V-A3, V-A4 (a–e) |
 | 4 | V-B1, V-B2, V-B3 |
-| 5 | V-B4 stages 1→3 |
+| 5 | V-A5 (before the robot moves), then V-B4 stages 1→3 |
 
 ---
 

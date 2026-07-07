@@ -93,6 +93,21 @@ parser.add_argument(
     "(a multiple of the 0.04 s planner period).",
 )
 parser.add_argument(
+    "--q0_noise",
+    type=float,
+    default=None,
+    help="V-A5: offset the plant's initial joint configuration by a "
+    "uniform per-joint draw in [-q0_noise, +q0_noise] rad. The reference "
+    "plan still starts at the nominal start_q — the hand-placed-robot "
+    "deployment case (nothing re-seeds the plan from the measured state).",
+)
+parser.add_argument(
+    "--q0_seed",
+    type=int,
+    default=0,
+    help="V-A5: seed of the --q0_noise offset draw.",
+)
+parser.add_argument(
     "--replay",
     nargs="?",
     const="latest",
@@ -191,6 +206,8 @@ if args.mass_scale is not None:
     scenario_tags.append(f"mass{args.mass_scale:g}")
 if args.latency > 0.0:
     scenario_tags.append(f"latency{args.latency:g}")
+if args.q0_noise is not None:
+    scenario_tags.append(f"q0noise{args.q0_noise:g}_seed{args.q0_seed}")
 scenario = "_".join(scenario_tags)
 
 # Define the task (cost and dynamics). The OCP tuning comes from the single
@@ -237,6 +254,19 @@ if args.mass_scale is not None:
 # Set the initial state
 mj_data = mujoco.MjData(mj_model)
 mj_data.qpos[:] = task.start_q
+if args.q0_noise is not None:
+    # V-A5: only the PLANT starts off the plan; task.start_q (and with it
+    # the reference trajectory) is untouched, so the controller must close
+    # the initial gap — exactly the real robot hand-placed near, not at,
+    # the home pose. Clipped clear of the joint limits.
+    offset = np.random.default_rng(args.q0_seed).uniform(
+        -args.q0_noise, args.q0_noise, mj_model.nq
+    )
+    mj_data.qpos[:] = np.clip(
+        task.start_q + offset,
+        mj_model.jnt_range[:, 0] + 0.05,
+        mj_model.jnt_range[:, 1] - 0.05,
+    )
 
 # Reference plan on the numpy side (x_des for the LFC law + metrics)
 plan_q = np.asarray(task.reference_qpos)
@@ -415,6 +445,24 @@ if not scenario:
     # Terminal accuracy is gated on nominal runs only ((b)-(d) gate
     # stability and margins; their tracking numbers are informational)
     gates["terminal_ee_error"] = (terminal_ee_err <= 0.010, terminal_ee_err)
+
+if args.q0_noise is not None:
+    # V-A5: the run must still land and settle. The terminal bound is the
+    # nominal 10 mm gate widened by the hold-wander spread (the terminal
+    # error is one draw from the hold jitter; the nominal run sits at
+    # 9.9 mm, so gating perturbed starts at 10 mm would flap on hold
+    # noise, not robustness). Settledness bounds the hold jitter itself
+    # (nominal hold qvel RMS is ~0.023 rad/s).
+    gates["q0_terminal_ee_error"] = (terminal_ee_err <= 0.015, terminal_ee_err)
+    gates["q0_hold_settled"] = (hold_qvel_rms <= 0.05, hold_qvel_rms)
+    extras["q0"] = {
+        "noise_rad": args.q0_noise,
+        "seed": args.q0_seed,
+        "qpos0": q_hist[0].tolist(),
+        "offset_norm_rad": float(
+            np.linalg.norm(q_hist[0] - np.asarray(task.start_q))
+        ),
+    }
 
 if args.mode == "feedback" and not scenario:
     # V-A4(a): the feedback reach must track at least as well as the
