@@ -129,6 +129,7 @@ def test_toy_particle_gains_match_fd(report):
         num_samples=64,
         noise_std=0.2 * jnp.ones(task.model.nu),
         temperature=0.1,
+        mean_adaptation_rate=0.5,  # FD also verifies the partial-update factor
         num_gain_samples=64,  # == num_samples: the analytic gain is exact
         compute_gains=True,
         plan_horizon=0.5,
@@ -162,19 +163,28 @@ def panda():
     return PandaPregrasp(options=options), config
 
 
-def _pregrasp_controller(task, config, num_gain_samples) -> FeedbackMPPI:
-    """The pairing glue of the example/adapter, with gains enabled."""
+def _pregrasp_controller(task, config, num_gain_samples, iterations) -> FeedbackMPPI:
+    """The pairing glue of the example/adapter, with gains enabled.
+
+    The FD cases pass ``iterations=1``: the gain formula is exact only for
+    the single-iteration update (with iterations > 1 the earlier
+    iterations' mean shifts also depend on x₀ and the published K is the
+    final iteration's gain — the same object the F-MPPI paper publishes;
+    documented in the port plan, Phase 3 findings). The timing gate runs
+    the deployment iterations.
+    """
     return FeedbackMPPI(
         task,
         num_samples=config.num_samples,
         noise_std=config.noise_scale * jnp.asarray(task.options.tau_max),
         temperature=config.temperature,
+        mean_adaptation_rate=config.mean_adaptation_rate,
         num_gain_samples=num_gain_samples,
         compute_gains=True,
         plan_horizon=config.plan_horizon,
         spline_type=config.spline_type,
         num_knots=config.num_knots,
-        iterations=config.iterations,
+        iterations=iterations,
     )
 
 
@@ -193,7 +203,7 @@ def panda_exact(panda):
     """Pregrasp controller with num_gain_samples == num_samples (exact)."""
     task, config = panda
     ctrl = _pregrasp_controller(
-        task, config, num_gain_samples=config.num_samples
+        task, config, num_gain_samples=config.num_samples, iterations=1
     )
     return task, ctrl, jax.jit(ctrl.optimize)
 
@@ -259,7 +269,9 @@ def test_cycle_with_gains_fits_the_25hz_budget(panda, report):
     gain batch num_gain_samples) and the deployment GPU.
     """
     task, config = panda
-    ctrl = _pregrasp_controller(task, config, config.num_gain_samples)
+    ctrl = _pregrasp_controller(
+        task, config, config.num_gain_samples, iterations=config.iterations
+    )
     jit_optimize = jax.jit(ctrl.optimize)
     plan_q = np.asarray(task.reference_qpos)
     plan_v = np.asarray(task.reference_qvel)

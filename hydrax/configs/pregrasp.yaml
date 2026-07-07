@@ -22,8 +22,9 @@ solver:
   num_samples: 1024
   noise_scale: 0.03 # sampling std = noise_scale * tau_max, per joint
   temperature: 0.007
+  mean_adaptation_rate: 1.0 # <1 damps the hold jitter (partial mean update)
   num_knots: 4
-  plan_horizon: 0.4 # seconds
+  plan_horizon: 0.32 # seconds (8 steps; H is the sequential depth of both the sampling and the gain path)
   iterations: 3
   num_gain_samples: 128 # gain batch: zero-noise nominal + lowest-cost samples
 

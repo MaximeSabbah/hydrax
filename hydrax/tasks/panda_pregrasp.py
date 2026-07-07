@@ -102,6 +102,13 @@ class PregraspControllerConfig:
     noise_scale: float = 0.03
 
     temperature: float = 0.01
+
+    # Fraction of the softmax mean update applied per iteration (1.0 = the
+    # plain MPPI update). Below 1 damps the solve-to-solve hover of tau_ff
+    # around a reached goal (the hold jitter) at the cost of slower
+    # convergence per iteration.
+    mean_adaptation_rate: float = 1.0
+
     plan_horizon: float = 0.4
     spline_type: str = "cubic"
     num_knots: int = 4

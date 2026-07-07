@@ -92,6 +92,7 @@ class FeedbackMPPI(SamplingBasedController):
         num_samples: int,
         noise_std: jax.Array,
         temperature: float,
+        mean_adaptation_rate: float = 1.0,
         num_gain_samples: int = 128,
         compute_gains: bool = False,
         num_randomizations: int = 1,
@@ -111,6 +112,17 @@ class FeedbackMPPI(SamplingBasedController):
                        shape (nu,).
             temperature: The temperature parameter λ. Higher values take a
                          more even average over the samples.
+            mean_adaptation_rate: Fraction of the softmax mean update
+                         applied per iteration (1.0 = the plain MPPI
+                         update; house precedent: MppiCma's
+                         covariance_adaptation_rate). At a reached goal
+                         the softmax mean hovers around the optimum with
+                         the sampling noise, and the applied tau_ff steps
+                         by that hover every solve — the dominant hold
+                         jitter (measured ~0.5-1 N·m per 25 Hz solve).
+                         A rate α < 1 damps the hover's stationary
+                         variance to α/(2−α) of the raw update's, at the
+                         cost of slower convergence per iteration.
             num_gain_samples: Rollouts used for the gain computation: the
                               zero-noise nominal + the lowest-cost samples.
             compute_gains: Whether optimize also computes K = du*/dx₀.
@@ -139,6 +151,11 @@ class FeedbackMPPI(SamplingBasedController):
         self.noise_std = jnp.asarray(noise_std, dtype=jnp.float32)
         assert self.noise_std.shape == (task.model.nu,)
 
+        if not 0.0 < mean_adaptation_rate <= 1.0:
+            raise ValueError(
+                f"mean_adaptation_rate ({mean_adaptation_rate}) must be "
+                "in (0, 1]"
+            )
         if not 1 <= num_gain_samples <= num_samples:
             raise ValueError(
                 f"num_gain_samples ({num_gain_samples}) must be in "
@@ -153,6 +170,7 @@ class FeedbackMPPI(SamplingBasedController):
             )
         self.num_samples = num_samples
         self.temperature = temperature
+        self.mean_adaptation_rate = mean_adaptation_rate
         self.num_gain_samples = num_gain_samples
         self.compute_gains = compute_gains
 
@@ -191,11 +209,16 @@ class FeedbackMPPI(SamplingBasedController):
     def update_params(
         self, params: FeedbackMPPIParams, rollouts: Trajectory
     ) -> FeedbackMPPIParams:
-        """Update the mean with an exponentially weighted average (as MPPI)."""
+        """Update the mean with an exponentially weighted average (as MPPI),
+        applied at the mean adaptation rate."""
         costs = jnp.sum(rollouts.costs, axis=1)  # sum over time steps
         # N.B. jax.nn.softmax takes care of details like baseline subtraction.
         weights = jax.nn.softmax(-costs / self.temperature, axis=0)
         mean = jnp.sum(weights[:, None, None] * rollouts.knots, axis=0)
+        mean = (
+            self.mean_adaptation_rate * mean
+            + (1.0 - self.mean_adaptation_rate) * params.mean
+        )
         return params.replace(mean=mean)
 
     def optimize(
@@ -272,7 +295,12 @@ class FeedbackMPPI(SamplingBasedController):
             -weights[:, None] * (gradients - weights_grad_shift)
             / self.temperature
         )
-        gains = jnp.einsum("bi,bo->oi", weights_grad, samples_delta)
+        # The partial mean update scales the sensitivity:
+        # u* = rate·Σ w u + (1 − rate)·u_nominal, and only the first term
+        # depends on x₀ (the FD gate verifies this factor end-to-end).
+        gains = self.mean_adaptation_rate * jnp.einsum(
+            "bi,bo->oi", weights_grad, samples_delta
+        )
         ess = 1.0 / jnp.sum(jnp.square(weights))
         return jnp.nan_to_num(gains), ess, weights[0]
 
@@ -285,9 +313,13 @@ class FeedbackMPPI(SamplingBasedController):
         eval_rollouts physics/cost sequence as a scalar function of
         (qpos, qvel) — mjx.step recomputes every derived quantity from
         them, so replacing qpos/qvel is a complete state perturbation —
-        and evaluate its jvp along the nq + nv basis directions.
-        Forward-mode, because reverse-mode AD does not work through MJX's
-        internal solver while loops.
+        and evaluate its forward-mode derivative along the nq + nv basis
+        directions (reverse-mode AD does not work through MJX's internal
+        solver while loops). The primal recomputation per tangent is
+        deliberate: a ``jax.linearize`` variant (primal evaluated once,
+        tape reused by all tangents) measured SLOWER on the deployment
+        GPU — the tape is memory-bandwidth-bound while the recompute runs
+        on idle FLOPs (2026-07-06; both forms pass the V-A2 FD gate).
         """
 
         def rollout_cost(qpos: jax.Array, qvel: jax.Array) -> jax.Array:

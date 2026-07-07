@@ -491,6 +491,36 @@ end-to-end. Two deployment findings:
    (research mode), a phase machine that switches mode after the reach
    (future planner-side work), or revisiting the law.
 
+*Phase 4 finale (2026-07-06) — both issues addressed, config frozen.*
+User confirmed both findings in their own viewer run. Measured fixes:
+- Dead ends (all measured, kept out): `mean_adaptation_rate` α < 1
+  (CEM-style partial mean update — implemented, FD-verified, but α 0.5
+  /0.3 worsened terminal AND wander: the arm drifts on the weak
+  K-spring and a slower mean update slows the chase; the knob stays at
+  the neutral 1.0), velocity_weight ↑ (wander −25 % but chronic ESS
+  collapse), gain batch 64 (the gain path is latency-bound in the H
+  sequential steps, not batch-bound), `jax.linearize` gains (tape is
+  memory-bound; the vmap-of-jvp recompute is faster — documented in
+  the code).
+- **The winning lever: plan_horizon 0.4 → 0.32 s** (H 10 → 8), cutting
+  the sequential depth shared by sampling and gains: cycle 29.7/31.2 ms
+  (9 ms margin), terminal 7.5 mm, ESS min 87, wander 0.0184 rad — the
+  best measured point on every axis simultaneously.
+- **Frozen config**: T=0.007, plan_horizon=0.32, iterations=3,
+  1024 samples, gain batch 128, noise 0.03·τ_max, weights 1.0/0.1/0.01,
+  mean_adaptation_rate 1.0. Full re-gate at this config: V-A1
+  (feedforward baseline 1.6 mm), V-A2 4/4 (FD 0.02–0.16 %; the FD cases
+  certify the formula at iterations=1, the deployed K is the
+  final-iteration gain per the Phase 3 decision), V-A4 scenarios all
+  stable (ESS 80–88; disturbance rejection remains 2.7× behind the
+  impedance — known and accepted), V-B1 10/10 (adapter get_action now
+  jitted), V-B3 124/0, and **V-B2: 1 deadline miss / 928 solves
+  (0.1 %, gate < 1 % PASS), planning mean 30.7 / p95 32.4 ms,
+  928/928 outputs accepted, exact_feedback end-to-end.** Residual hold
+  wander ≈ 0.02 rad spans (joint-velocity RMS down ~35 % from the first
+  deployment) — accepted for the first robot sessions; the phase
+  machine stays the future option. Next: V-B4 stage 1–2 on the robot.
+
 **Phase 5 — robot.** Gate: V-B4; definition of done.
 
 **Phase 6 — thin bridge rebuild (deferred).** Execute the `sbmpc_ros/doc/`

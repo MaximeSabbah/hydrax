@@ -31,6 +31,7 @@ _PREGRASP_YAML_SCHEMA = {
         "num_samples": ("config", "num_samples"),
         "noise_scale": ("config", "noise_scale"),
         "temperature": ("config", "temperature"),
+        "mean_adaptation_rate": ("config", "mean_adaptation_rate"),
         "num_knots": ("config", "num_knots"),
         "plan_horizon": ("config", "plan_horizon"),
         "iterations": ("config", "iterations"),

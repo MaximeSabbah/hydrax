@@ -212,6 +212,7 @@ ctrl = FeedbackMPPI(
     num_samples=config.num_samples,
     noise_std=config.noise_scale * tau_max,
     temperature=config.temperature,
+    mean_adaptation_rate=config.mean_adaptation_rate,
     num_gain_samples=config.num_gain_samples,
     compute_gains=(args.mode == "feedback"),
     plan_horizon=config.plan_horizon,
@@ -384,6 +385,11 @@ for k in range(n_steps):
 mujoco.mj_forward(mj_model, mj_data)
 terminal_ee_err = float(np.linalg.norm(mj_data.site_xpos[site_id] - goal_pos))
 rms_q_err = np.sqrt(q_err_sq_sum / n_steps)
+# Hold-window wander (the jitter at the reached pose): joint span and
+# velocity over the final 1 s. The sweep target for mean_adaptation_rate.
+hold = q_hist[-1000:]
+hold_q_span = float((hold.max(axis=0) - hold.min(axis=0)).max())
+hold_qvel_rms = float(np.sqrt(np.mean(np.square(np.diff(hold, axis=0) / mj_model.opt.timestep))))
 steady = np.asarray(solve_ms[1:])
 check = "V-A1" if args.mode == "feedforward" else "V-A4"
 run_name = f"{check}_{args.mode}" + (f"_{scenario}" if scenario else "")
@@ -487,6 +493,10 @@ for name, (passed, value) in gates.items():
     print(f"  {name:26s} {'PASS' if passed else 'FAIL'}  ({value})")
 print(f"VERDICT: {'PASS' if ok else 'FAIL'}")
 print(f"rms q err per joint [rad]: {np.round(rms_q_err, 4)}")
+print(
+    f"hold wander: q_span={hold_q_span:.4f} rad  "
+    f"qvel_rms={hold_qvel_rms:.4f} rad/s"
+)
 
 # Report JSON + trajectory recording for --replay. Fixed filenames: each
 # run overwrites the previous artifacts for this check+mode (nothing
@@ -519,6 +529,8 @@ report = {
     "gates": {k: {"pass": p, "value": v} for k, (p, v) in gates.items()},
     "rms_q_err_per_joint": rms_q_err.tolist(),
     "terminal_ee_error": terminal_ee_err,
+    "hold_q_span_rad": hold_q_span,
+    "hold_qvel_rms": hold_qvel_rms,
     "verdict": "PASS" if ok else "FAIL",
     **extras,
 }
