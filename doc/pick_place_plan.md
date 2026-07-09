@@ -116,18 +116,31 @@ CLOSE/OPEN advance after the gripper dwell (sim: fixed dwell; ROS:
 action-result confirmation — the franka grasp action reports
 width/success, which is the grasp verification with a fixed cube pose).
 
-**Per-phase references (the only new controller-facing mechanics).** On
-phase entry the task plans a min-jerk joint segment from the *measured*
-posture to the phase's IK goal, with the phase's velocity cap — the
-pregrasp generator, replanned per phase (CPU, milliseconds, once per
-phase, off the 25 Hz hot path). Two properties fall out for free:
-- **no feedforward yank**: each segment starts at the measured pose, so
-  even the stiff impedance law is safe at phase entry (the V-A5
-  feedforward failure mode was a reference *not* starting at the robot);
-- **no recompilation**: the reference is data (fixed-shape, padded
-  time-indexed arrays, the existing `state.time` lookup); phase entry
-  swaps array contents, never code. This must be asserted by a P-A2
-  timing gate (no solve-time spike at transitions), not assumed.
+**The reference: one chained timeline + an event-gated plan clock (P1
+amendment, 2026-07-09, as built).** The original draft replanned each
+segment from the measured posture at phase entry; that is mechanically
+unsound — the reference arrays are compile-time CONSTANTS of the jitted
+cost (swapping their contents at runtime silently does nothing, and
+re-tracing violates the no-recompile requirement). The implemented
+design keeps the intent: the task precomputes ONE timeline chaining
+min-jerk segments goal-to-goal (velocity-capped, floored at
+`min_segment_sec`; constant segments for the dwells; inverse-dynamics
+feedforward throughout — the pregrasp generator, run once at
+construction), and `PickPlacePhaseMachine` owns `state.time`: the clock
+advances normally inside a segment and refuses to cross a segment
+boundary until the arm has converged on the segment goal (tighter
+`precision_q_tolerance` on the two boundaries entering dwells, where the
+gripper acts). The properties survive:
+- **event-driven progress**: a slow phase stalls the reference on its
+  goal instead of being abandoned; each segment starts from a
+  converged (measured-to-tolerance) posture, so the impedance law is
+  safe at every boundary;
+- **no recompilation by construction**: the reference is a constant,
+  exactly like the pregrasp; the P-A2 `solve_max_ms` gate asserts it.
+  Gotcha for the record: an `np.float64` leaking from the boundary
+  array into `state.time` changes the traced dtype and caused a silent
+  35 s recompile at the first clock stall — the clock is pinned to a
+  python float and P-A1 asserts the type.
 
 **Cost and solver: unchanged.** The pregrasp tracking cost (saturated
 q/v/u errors, weights 1.0/0.1/0.01) against the active segment; frozen
@@ -149,6 +162,19 @@ both already certified and both inside the existing bridge contract:
 P-A2 measures the dwell precision in exact_feedback first; the remedy
 (likely 1) is adopted only if the measurement demands it, and the choice
 is recorded here.
+
+*Measured and decided (2026-07-09, P-A2):* pure exact_feedback delivered
+**13.2 mm lateral / 10.7 mm vertical** EE error at the close command —
+the controller's known ~1 cm steady-state precision, insufficient for
+the 1 cm / 5 mm grasp gates. **Remedy 1 adopted**, as the
+settle-then-actuate dwell: for the first `dwell_settle_sec` of each
+dwell the 1 kHz law is the stiff impedance on the (stationary) dwell
+reference, and only then does the gripper actuate (OPEN keeps holding
+the cube through its settle, then releases). Result: **1.5 mm lateral /
+1.0 mm vertical** at the close command, cube placed 8 mm from target —
+P-A2 all 16 gates PASS. In the ROS deployment this is expressible
+per-cycle inside the existing bridge contract (impedance K anchored on
+the reference during dwells), wired in P3.
 
 ## Validation protocol
 
@@ -213,7 +239,19 @@ pregrasp task must be untouched by the pick-place addition).
 |-------|----------------|
 | P0 | planning scene loads + steps in MJX; plant-vs-planning model parity checks; plan reviewed |
 
-**P0 status (2026-07-09): COMPLETE, including the model consolidation**
+**P1 status (2026-07-09): COMPLETE — the cube is picked and placed in
+Tier A.** Built: `hydrax/tasks/panda_pick_place.py` (PandaPickPlace over
+the pregrasp machinery, `PandaPickPlaceOptions` +
+`PickPlaceControllerConfig` mirroring the pregrasp pair per user review,
+`PickPlacePhaseMachine`), `configs/pick_place.yaml` + `load_pick_place_config`
+(shared `_load_yaml_values` helper), `examples/panda_pick_place.py`,
+`tests/test_pick_place_phase_machine.py`. Gates: **P-A1 9/9**; **P-A2
+feedback nominal 16/16 PASS** — full sequence in 16.8 s (timeline 15.3 s
++ convergence stalls, all phases transitioned), grasp precision at the
+close command 1.5 mm lateral / 1.0 mm vertical (impedance dwell), cube
+lifted to 0.17 m and placed 8 mm from the target, torque margin 0.54,
+velocity 0.21, ESS min 94, solve 29.6 mean / 31.1 p95 / 34.3 max ms (no
+recompiles). Pregrasp untouched: V-A1 re-run bit-identical (0.7678 mm).
 (decisions log). Plant built and verified: arm parity vs the planning
 model IDENTICAL (joint names/ranges/damping/armature, ctrlranges, link
 masses, hand subtree mass); 2 s open-loop hold under the computed

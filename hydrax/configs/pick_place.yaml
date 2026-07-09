@@ -1,0 +1,57 @@
+# Pick-and-place OCP tuning — THE single tuning surface for the Tier A
+# gates, the ROS simulation, and the real robot (all consumers load this
+# file through hydrax.configs.load_pick_place_config; nothing can
+# override it from the ROS parameter layer).
+#
+# Values only: cost functions and everything not listed here (phase
+# structure, EE offsets, robot limits, domain randomization) are code, in
+# PandaPickPlaceOptions, and changing them is a reviewed code change.
+# Unknown keys in this file are an error.
+#
+# The solver section starts from the FROZEN pregrasp configuration
+# (certified through V-B4 on the real robot); rerun the P-A gates before
+# trusting a changed value.
+
+costs:
+  configuration_weight: 1.0
+  velocity_weight: 0.1
+  control_weight: 0.01
+
+solver:
+  num_samples: 1024
+  noise_scale: 0.03 # sampling std = noise_scale * tau_max, per joint
+  temperature: 0.007
+  mean_adaptation_rate: 1.0
+  num_knots: 4
+  spline_type: linear # knot interpolation (gains need knot-linearity)
+  plan_horizon: 0.32 # seconds (8 steps; the shared sequential depth)
+  iterations: 3
+  num_gain_samples: 128 # gain batch: zero-noise nominal + lowest-cost samples
+
+# The phase timeline: per-segment durations come from the velocity cap
+# (floored by min_segment_sec for gentle precision moves); the plan clock
+# crosses a segment boundary only once the arm is within the transition
+# tolerances of the segment goal (dwells are time-only).
+plan:
+  max_velocity_fraction: 0.20
+  min_segment_sec: 1.5
+  dwell_sec: 1.0
+  dwell_settle_sec: 0.5 # impedance-settle before the gripper actuates
+  transition_q_tolerance: 0.05 # rad; must exceed the ~0.02-0.03 rad hold wander
+  transition_v_tolerance: 0.15 # rad/s
+  precision_q_tolerance: 0.02 # rad; the DESCEND->CLOSE / PLACE->OPEN gates
+
+# Cube and placement poses, measured BY HAND on the real setup before a
+# session (deployment decision 2026-07-09: fixed values, no perception).
+# Defaults match the scene.xml bodies; the P-A3 grid certifies a ±1 cm
+# neighborhood around them.
+geometry:
+  cube_pos: [0.5, 0.0, 0.025]
+  target_pos: [0.65, 0.0, 0.025]
+
+# The feedforward-mode low level (as pregrasp): per-joint impedance
+# published to LFC as K = -[diag(kp) | diag(kd)], anchored on the plan
+# reference. Not used in exact_feedback mode.
+feedforward:
+  kp: [1000.0, 1000.0, 1000.0, 1000.0, 20.0, 10.0, 5.0]
+  kd: [5.0, 5.0, 5.0, 5.0, 2.0, 2.0, 1.0]
