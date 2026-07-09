@@ -124,10 +124,10 @@ class PregraspControllerConfig:
 class PandaPregrasp(Task):
     """The Panda tracks a minimum-jerk joint plan to a pregrasp pose.
 
-    The model (models/panda/pregrasp.xml) is the 7-DoF torque-controlled
-    Panda: direct torque motors at the Franka limits, contacts disabled,
-    timestep = the 25 Hz control period, so rollouts take one physics step
-    per control step.
+    The model is the 7-DoF planning variant of models/panda/panda.xml,
+    derived at load time (see _derive_arm_planning_model): direct torque
+    motors at the Franka limits, contacts disabled, timestep = the 25 Hz
+    control period, so rollouts take one physics step per control step.
 
     All references are generated at construction, self-contained:
       1. damped-least-squares IK gives the goal configuration for the
@@ -154,14 +154,12 @@ class PandaPregrasp(Task):
                      geometry, the reference plan, and domain randomization
                      ranges.
         """
-        mj_model = mujoco.MjModel.from_xml_path(
-            ROOT + "/models/panda/pregrasp.xml"
-        )
-        super().__init__(mj_model, trace_sites=["gripper"], impl=impl)
-
         if options is None:
             options = PandaPregraspOptions()
         self.options = options
+
+        mj_model = self._derive_arm_planning_model(options.start_q)
+        super().__init__(mj_model, trace_sites=["gripper"], impl=impl)
 
         # Reference plan: IK goal, then a quintic joint plan sampled at the
         # control period, then inverse-dynamics feedforward torques.
@@ -206,6 +204,39 @@ class PandaPregrasp(Task):
         self.control_cost_weight = (
             options.control_cost_weight / total_weights
         )
+
+    @staticmethod
+    def _derive_arm_planning_model(home_q) -> mujoco.MjModel:
+        """The 7-DoF PLANNING variant of models/panda/panda.xml.
+
+        There is one robot description (panda.xml: arm + articulated
+        gripper, torque motors, position-servo gripper). The MPPI plans
+        only the arm, so its model is derived here at load time: finger
+        joints removed (bodies and inertia stay — the hand keeps its true
+        mass), gripper actuator and finger coupling dropped, contacts
+        disabled, and the timestep set to the 25 Hz control period so
+        rollouts take one physics step per control step. ``home_q``
+        becomes the model's home keyframe.
+
+        tests/test_panda_model.py pins these invariants and the arm
+        parity with the plant; the derivation was asserted structurally
+        identical to the previously committed pregrasp.xml before that
+        file was removed (2026-07-09 model consolidation).
+        """
+        spec = mujoco.MjSpec.from_file(ROOT + "/models/panda/panda.xml")
+        for joint in list(spec.joints):
+            if joint.name in ("finger_joint1", "finger_joint2"):
+                spec.delete(joint)
+        for actuator in list(spec.actuators):
+            if actuator.name == "actuator8":
+                spec.delete(actuator)
+        for equality in list(spec.equalities):
+            spec.delete(equality)
+        spec.option.timestep = 0.04
+        spec.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
+        spec.option.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
+        spec.add_key(name="home", qpos=list(home_q))
+        return spec.compile()
 
     def _solve_ik(
         self,

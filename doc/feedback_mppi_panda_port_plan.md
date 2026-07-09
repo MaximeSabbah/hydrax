@@ -392,6 +392,21 @@ recorded with the existing replay tooling):
    feedforward run at the same fraction; logged ‖K‖ time series satisfies
    V-A3 bounds throughout.
 
+(The pick-and-place follow-up lives in its own plan: `doc/pick_place_plan.md`.
+Note, 2026-07-09 model consolidation from that plan: `pregrasp.xml` /
+`pregrasp_scene.xml` referenced throughout this historical document were
+retired — the planning model is now derived at load time from
+`models/panda/panda.xml`, proven structurally identical, all gates re-run
+green.)
+
+**V-B4 status (2026-07-09): REAL-ROBOT DEPLOYMENT SUCCESSFUL.** The user
+ran the pregrasp task on hardware with the exact_feedback controller —
+"worked really well", "very smooth deployment". One open item: launching
+on the real robot with `publish_rollout_markers:=true` failed (error text
+not captured; the marker path is backend-agnostic in the bridge, so this
+is unreproduced — needs the launch log from a failing real session).
+Workaround until then: keep markers off on real, use them in sim.
+
 ### Phase → gate map
 
 | Phase | Gate = all of |

@@ -142,19 +142,22 @@ if args.replay is not None:
     plan_q, plan_fps = rec["plan_qpos"], float(rec["plan_fps"])
     print(f"replaying {traj_path} ({rec_t[-1]:.1f} s, {len(rec_t)} frames)")
 
-    # The visual scene wrapper (floor, lights, object) — same nq as the
-    # planning model, so recorded joint trajectories replay directly.
+    # The visual scene is the full plant (floor, lights, cube, target).
+    # Pregrasp recordings hold only the 7 arm joints; the fingers and the
+    # cube stay at the home keyframe during playback.
     mj_model = mujoco.MjModel.from_xml_path(
-        ROOT + "/models/panda/pregrasp_scene.xml"
+        ROOT + "/models/panda/scene.xml"
     )
     mj_data = mujoco.MjData(mj_model)
-    mj_data.qpos[:] = rec_q[0]
+    mujoco.mj_resetDataKeyframe(mj_model, mj_data, 0)
+    mj_data.qpos[:7] = rec_q[0]
     mujoco.mj_forward(mj_model, mj_data)
 
     with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
         if args.show_reference:
             ref_data = mujoco.MjData(mj_model)
-            ref_data.qpos[:] = plan_q[0]
+            mujoco.mj_resetDataKeyframe(mj_model, ref_data, 0)
+            ref_data.qpos[:7] = plan_q[0]
             mujoco.mj_forward(mj_model, ref_data)
             vopt = mujoco.MjvOption()
             vopt.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = True
@@ -168,13 +171,13 @@ if args.replay is not None:
         while viewer.is_running():
             for k in range(0, len(rec_t), frame_step):
                 start = time.time()
-                mj_data.qpos[:] = rec_q[k]
+                mj_data.qpos[:7] = rec_q[k]
                 mujoco.mj_forward(mj_model, mj_data)
                 if args.show_reference:
                     i_ref = min(
                         int(rec_t[k] * plan_fps), plan_q.shape[0] - 1
                     )
-                    ref_data.qpos[:] = plan_q[i_ref]
+                    ref_data.qpos[:7] = plan_q[i_ref]
                     mujoco.mj_forward(mj_model, ref_data)
                     mujoco.mjv_updateScene(
                         mj_model,

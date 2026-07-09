@@ -1,9 +1,17 @@
+<!-- THE environment: free-joint cube, placement-target mocap (in front of
+     the robot, y=0 — user request 2026-07-09), contact floor, task
+     sensors, home keyframe with computed gravity-compensation ctrl for
+     the torque motors. Timestep 0.001: this is the 1 kHz PLANT for the
+     Tier A examples, matching the deployment plant (the sbmpc original's
+     0.005 planning timestep is measurably unstable here — the arm falls
+     within 1 s under exact gravity comp). Lineage:
+     sbmpc/models/panda_pick_place/scene.xml. -->
 <mujoco model="panda pick and place">
   <include file="panda.xml"/>
 
   <statistic center="0.3 0 0.4" extent="1"/>
 
-  <option timestep="0.005" iterations="5" ls_iterations="8" integrator="implicitfast">
+  <option timestep="0.001" iterations="5" ls_iterations="8" integrator="implicitfast">
     <flag eulerdamp="disable"/>
   </option>
 
@@ -45,7 +53,7 @@
     </body>
 
     <!-- Target placement position (mocap, user-draggable) -->
-    <body mocap="true" name="target" pos="0.5 0.3 0.15">
+    <body mocap="true" name="target" pos="0.65 0.0 0.025">
       <geom type="box" size="0.02 0.02 0.025" rgba="1 0.2 0.2 0.3"
        contype="0" conaffinity="0"/>
     </body>
@@ -70,6 +78,6 @@
     <key name="home"
       qpos="0 -0.785 0 -2.356 0 1.571 0.785 0.04 0.04
             0.5 0.0 0.025 1 0 0 0"
-      ctrl="0 -0.785 0 -2.356 0 1.571 0.785 0.04"/>
+      ctrl="0.0 -4.0002579 -0.6437449 22.0221667 0.6338477 2.2781773 -0.0 0.04"/>
   </keyframe>
 </mujoco>
