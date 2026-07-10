@@ -55,7 +55,10 @@ class PandaPickPlaceOptions:
     pregrasp_offset: Tuple[float, float, float] = (0.0, 0.0, 0.075)
     grasp_offset: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     carry_offset: Tuple[float, float, float] = (0.0, 0.0, 0.15)
-    place_offset: Tuple[float, float, float] = (0.0, 0.0, 0.005)
+    # Release with the cube essentially seated: the cube migrates up to
+    # ~1 cm within the grip during the run (P-A3 measured), so a higher
+    # release drops it and scatters the placement by the bounce
+    place_offset: Tuple[float, float, float] = (0.0, 0.0, 0.002)
     retreat_offset: Tuple[float, float, float] = (0.0, 0.0, 0.15)
 
     # EE orientation for every phase: gripper pointing down
@@ -314,6 +317,13 @@ class PickPlacePhaseMachine:
         # kept a python float: an np.float64 leaking into state.time
         # changes the traced dtype and silently recompiles the solver
         self.plan_time = 0.0
+        # set while holding at a dwell-entry boundary: under model
+        # mismatch exact_feedback's steady sag (0.034 rad measured at
+        # P-A3 mass 1.1) exceeds the 0.02 rad precision gate it is asked
+        # to satisfy — a deadlock only the impedance (residual ~
+        # mismatch/kp ~ 0.002 rad) can break, so the precision hold
+        # engages during the wait, not just inside the dwell
+        self._stalled_at_dwell_entry = False
 
     @property
     def phase(self) -> Phase:
@@ -331,9 +341,10 @@ class PickPlacePhaseMachine:
 
     @property
     def precision_hold(self) -> bool:
-        """True while the 1 kHz law must be the stiff impedance (the
-        stationary dwells — the grasp/place precision windows)."""
-        return self.phase in _DWELL_PHASES
+        """True while the 1 kHz law must be the stiff impedance: the
+        stationary dwells and the waits at their entry boundaries — the
+        grasp/place precision windows."""
+        return self.phase in _DWELL_PHASES or self._stalled_at_dwell_entry
 
     def _time_into_phase(self) -> float:
         phase = self.phase
@@ -350,10 +361,23 @@ class PickPlacePhaseMachine:
         t_next = self.plan_time + self._dt
         if t_next < boundary:
             self.plan_time = t_next
+            self._stalled_at_dwell_entry = False
         elif phase in _DWELL_PHASES or self._converged(q, v, phase):
             self.plan_time = t_next  # cross into the next phase
+            self._stalled_at_dwell_entry = False
         else:
             self.plan_time = float(boundary)  # hold the segment goal
+            # The impedance engages only once exact_feedback has decayed
+            # the arrival lag to the ordinary transition tolerance:
+            # engaging on the first hold cycle (arrival lag ~0.1 rad
+            # under mismatch) yanks — kp x 0.1 rad exceeds the torque
+            # and velocity margins (measured). Within +-0.05 rad the
+            # engagement is V-A5-certified safe, and the impedance
+            # closes the precision leg (0.05 -> ~0.002 rad).
+            q_err = np.abs(np.asarray(q) - self._goals[phase]).max()
+            self._stalled_at_dwell_entry = (
+                Phase(phase + 1) in _DWELL_PHASES and q_err <= self._q_tol
+            )
         return self.plan_time
 
     def _converged(self, q: np.ndarray, v: np.ndarray, phase: Phase) -> bool:

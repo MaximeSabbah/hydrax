@@ -62,6 +62,43 @@ parser.add_argument(
     help="Extra settle time after the sequence completes (s).",
 )
 parser.add_argument(
+    "--q0_noise",
+    type=float,
+    default=None,
+    help="P-A3: offset the plant's initial arm configuration by a uniform "
+    "per-joint draw in [-q0_noise, +q0_noise] rad (hand-placed robot; the "
+    "reference timeline still starts at the nominal start_q).",
+)
+parser.add_argument(
+    "--q0_seed", type=int, default=0, help="P-A3: seed of the q0 draw."
+)
+parser.add_argument(
+    "--cube_noise",
+    type=float,
+    default=None,
+    help="P-A3: offset the TRUE cube position by a uniform draw in "
+    "[-cube_noise, +cube_noise] m in x and y, while the task keeps the "
+    "nominal configured pose — the hand-measurement-error axis; the blind "
+    "grasp must still succeed.",
+)
+parser.add_argument(
+    "--cube_seed", type=int, default=0, help="P-A3: seed of the cube draw."
+)
+parser.add_argument(
+    "--mass_scale",
+    type=float,
+    default=None,
+    help="P-A3: scale the plant body masses (e.g. 0.9 or 1.1); the "
+    "planner's model is untouched.",
+)
+parser.add_argument(
+    "--cube_friction",
+    type=float,
+    default=None,
+    help="P-A3: scale the cube's sliding friction (e.g. 0.5) — the slip "
+    "axis; the planner never knows the cube exists.",
+)
+parser.add_argument(
     "--replay",
     nargs="?",
     const="latest",
@@ -70,6 +107,17 @@ parser.add_argument(
     help="Replay a recorded run in the viewer instead of running.",
 )
 args = parser.parse_args()
+
+scenario_tags = []
+if args.q0_noise is not None:
+    scenario_tags.append(f"q0noise{args.q0_noise:g}_seed{args.q0_seed}")
+if args.cube_noise is not None:
+    scenario_tags.append(f"cube{args.cube_noise:g}_seed{args.cube_seed}")
+if args.mass_scale is not None:
+    scenario_tags.append(f"mass{args.mass_scale:g}")
+if args.cube_friction is not None:
+    scenario_tags.append(f"fric{args.cube_friction:g}")
+scenario = "_".join(scenario_tags)
 
 
 if args.replay is not None:
@@ -141,10 +189,30 @@ initial_knots = task.reference_ctrl[knot_idx]
 
 # The PLANT: full scene at 1 kHz (articulated fingers, contacts, cube)
 mj_model = mujoco.MjModel.from_xml_path(ROOT + "/models/panda/scene.xml")
+if args.mass_scale is not None:
+    mj_model.body_mass *= args.mass_scale
+if args.cube_friction is not None:
+    mj_model.geom("object_geom").friction[0] *= args.cube_friction
 mj_data = mujoco.MjData(mj_model)
 mujoco.mj_resetDataKeyframe(mj_model, mj_data, 0)
 site_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_SITE, "gripper")
 CUBE_Q = slice(9, 12)  # cube free-joint position in the plant qpos
+if args.q0_noise is not None:
+    # only the PLANT starts off the plan (hand-placed robot); the
+    # reference timeline still begins at start_q
+    offset = np.random.default_rng(args.q0_seed).uniform(
+        -args.q0_noise, args.q0_noise, 7
+    )
+    mj_data.qpos[:7] = np.clip(
+        np.asarray(task.start_q) + offset,
+        mj_model.jnt_range[:7, 0] + 0.05,
+        mj_model.jnt_range[:7, 1] - 0.05,
+    )
+if args.cube_noise is not None:
+    # the TRUE cube is off the hand-measured config pose (x, y)
+    mj_data.qpos[9:11] += np.random.default_rng(args.cube_seed).uniform(
+        -args.cube_noise, args.cube_noise, 2
+    )
 
 plan_q = np.asarray(task.reference_qpos)
 plan_v = np.asarray(task.reference_qvel)
@@ -165,10 +233,11 @@ print(f"Time to jit: {time.time() - st:.3f} seconds")
 
 control_period = task.dt
 steps_per_cycle = int(round(control_period / mj_model.opt.timestep))
-# Stall protection: the clock gating may stretch the sequence, but a
-# healthy run stays close to the nominal duration. Exceeding the budget
-# fails the no_stall gate.
-time_budget = 1.5 * task.duration + args.hold
+# Stall protection: the clock gating may stretch the sequence — under a
+# 10 % mass mismatch (P-A3) the certified-safe convergence waits add up
+# to ~8 s of legitimate stalls — but a healthy run must still terminate.
+# Exceeding the budget fails the no_stall gate.
+time_budget = 2.0 * task.duration + args.hold
 max_steps = int(round(time_budget / mj_model.opt.timestep))
 
 pm = PickPlacePhaseMachine(task)
@@ -195,7 +264,8 @@ cube_lift_max = float(mj_data.qpos[CUBE_Q][2])
 done_at: float | None = None
 
 print(
-    f"mode={args.mode}  timeline={task.duration:.1f}s "
+    f"mode={args.mode}  scenario={scenario or 'nominal'}  "
+    f"timeline={task.duration:.1f}s "
     f"(budget {time_budget:.1f}s) + hold {args.hold}s"
 )
 
@@ -303,13 +373,20 @@ steady = np.asarray(solve_ms[1:])
 close_cmd = grip_events.get("close")
 open_entry = phase_entries.get(Phase.OPEN.name)
 
-# grasp precision at the close-command instant: EE vs the ACTUAL cube
+# Grasp precision at the close-command instant: EE vs the COMMANDED
+# grasp pose (nominal cube + grasp offset). Under --cube_noise the actual
+# cube is elsewhere by construction — the arm's job is to hit the
+# commanded pose; whether the offset cube still gets captured is what
+# cube_lifted / cube_placed certify. The actual cube is in the report.
 grasp_err = None
 if close_cmd is not None:
-    d = close_cmd["ee"] - close_cmd["cube"]
+    d = close_cmd["ee"] - (
+        np.asarray(task.options.cube_pos)
+        + np.asarray(task.options.grasp_offset)
+    )
     grasp_err = {
         "lateral_m": float(np.linalg.norm(d[:2])),
-        "vertical_m": float(abs(d[2] - task.options.grasp_offset[2])),
+        "vertical_m": float(abs(d[2])),
     }
 
 gates = {
@@ -327,8 +404,12 @@ gates = {
         cube_lift_max,
     ),
     "cube_placed": (
+        # a blind grasp cannot correct the cube-pose measurement error
+        # along the finger axis, so the placed cube inherits it: the
+        # tolerance widens by the injected offset under --cube_noise
         bool(
-            np.linalg.norm(cube_final[:2] - target_pos[:2]) <= 0.010
+            np.linalg.norm(cube_final[:2] - target_pos[:2])
+            <= 0.010 + (args.cube_noise or 0.0)
             and abs(cube_final[2] - cube_start_z) <= 0.005
         ),
         cube_final.tolist(),
@@ -413,7 +494,7 @@ print(
 )
 
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
-run_name = f"P-A2_{args.mode}"
+run_name = f"P-A2_{args.mode}" + (f"_{scenario}" if scenario else "")
 report = {
     "check": "P-A2",
     "date": datetime.now().isoformat(timespec="seconds"),
@@ -424,6 +505,7 @@ report = {
         cwd=Path(__file__).parent,
     ).stdout.strip(),
     "mode": args.mode,
+    "scenario": scenario or "nominal",
     "config": {
         "num_samples": ctrl.num_samples,
         "temperature": ctrl.temperature,
@@ -448,6 +530,7 @@ with open(REPORT_DIR / "history.jsonl", "a") as f:
                 "git_sha": report["git_sha"],
                 "check": "P-A2",
                 "mode": args.mode,
+                "scenario": scenario or "nominal",
                 "verdict": report["verdict"],
                 "cube_final": cube_final.tolist(),
                 "tau_frac": float(tau_frac_max.max()),

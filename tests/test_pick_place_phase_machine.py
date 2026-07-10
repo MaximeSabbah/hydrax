@@ -110,6 +110,8 @@ def test_clock_stalls_at_a_motion_boundary_until_converged(task):
         pm.update(q_far, np.zeros(7))
     assert pm.phase == Phase.PREGRASP
     assert pm.plan_time == pytest.approx(boundary)
+    # an ordinary (non-dwell-entry) stall stays on exact_feedback
+    assert not pm.precision_hold
     # high velocity also blocks the crossing
     pm.update(task.phase_goal_q[Phase.PREGRASP], np.full(7, 1.0))
     assert pm.phase == Phase.PREGRASP
@@ -132,6 +134,10 @@ def test_dwell_entries_use_the_precision_tolerance(task):
         offset = q_off if pm.phase == Phase.DESCEND else 0.0
         pm.update(goal + offset, np.zeros(7))
     assert pm.phase == Phase.DESCEND  # stalled at the precision gate
+    # the wait at a dwell entry IS a precision window: the impedance must
+    # engage here or a model-mismatch sag > the gate deadlocks the clock
+    # (P-A3 mass 1.1)
+    assert pm.precision_hold
     pm.update(task.phase_goal_q[Phase.DESCEND] + 0.01, np.zeros(7))
     pm.update(task.phase_goal_q[Phase.DESCEND] + 0.01, np.zeros(7))
     assert pm.phase == Phase.CLOSE
