@@ -46,8 +46,8 @@ plan:
 # Defaults match the scene.xml bodies; the P-A3 grid certifies a ±1 cm
 # neighborhood around them.
 geometry:
-  cube_pos: [0.5, 0.0, 0.025]
-  target_pos: [0.65, 0.0, 0.025]
+  cube_pos: [0.5, 0.0, 0.105]
+  target_pos: [0.65, 0.0, 0.105]
 
 # The feedforward-mode low level (as pregrasp): per-joint impedance
 # published to LFC as K = -[diag(kp) | diag(kd)], anchored on the plan
