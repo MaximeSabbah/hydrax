@@ -113,7 +113,7 @@ def test_clock_stalls_at_a_motion_boundary_until_converged(task):
         pm.update(q_far, np.zeros(7))
     assert pm.phase == Phase.PREGRASP
     assert pm.plan_time == pytest.approx(boundary)
-    # an ordinary (non-dwell-entry) stall stays on exact_feedback
+    # an ordinary (non-dwell-entry) stall is not a precision window
     assert not pm.precision_hold
     # high velocity also blocks the crossing
     pm.update(task.phase_goal_q[Phase.PREGRASP], np.full(7, 1.0))
@@ -137,9 +137,8 @@ def test_dwell_entries_use_the_precision_tolerance(task):
         offset = q_off if pm.phase == Phase.DESCEND else 0.0
         pm.update(goal + offset, np.zeros(7))
     assert pm.phase == Phase.DESCEND  # stalled at the precision gate
-    # the wait at a dwell entry IS a precision window: the impedance must
-    # engage here or a model-mismatch sag > the gate deadlocks the clock
-    # (P-A3 mass 1.1)
+    # The final wait at a dwell entry is reported as a precision window;
+    # gain-law selection is deliberately outside the phase machine.
     assert pm.precision_hold
     pm.update(task.phase_goal_q[Phase.DESCEND] + 0.01, np.zeros(7))
     pm.update(task.phase_goal_q[Phase.DESCEND] + 0.01, np.zeros(7))
@@ -209,8 +208,8 @@ def test_diagnostics_reports_the_tighter_descend_precision_gate(task):
     q = np.asarray(task.phase_goal_q[Phase.DESCEND]).copy()
     q[2] += 0.03
 
-    # One update at the boundary records the precision-hold schedule used to
-    # close the remaining 0.03 -> 0.02 rad leg on the real controller.
+    # One update at the boundary records the precision window while the
+    # remaining 0.03 -> 0.02 rad leg is still blocked.
     pm.update(q, np.zeros(7))
     snapshot = pm.diagnostics_snapshot(q, np.zeros(7))
 
@@ -251,9 +250,9 @@ def test_diagnostics_marks_dwell_boundaries_as_time_only(task):
 
 
 def test_gripper_schedule_settles_then_actuates(task):
-    # dwells are settle-then-actuate: the stiff impedance pins the arm for
-    # dwell_settle_sec before the gripper moves (P2 law schedule); OPEN
-    # keeps holding the cube through its settle, then releases
+    # Dwells are settle-then-actuate: the reference stays stationary for
+    # dwell_settle_sec before the gripper moves; OPEN keeps holding the
+    # cube through its settle, then releases.
     pm = PickPlacePhaseMachine(task)
     settle = task.options.dwell_settle_sec
     log = []
@@ -267,7 +266,7 @@ def test_gripper_schedule_settles_then_actuates(task):
 
     close_start = task.segment_end_times[Phase.DESCEND]
     for phase, t, closed, hold in in_phase(Phase.CLOSE):
-        assert hold  # impedance throughout the dwell
+        assert hold  # the whole dwell is a reported precision window
         assert closed == (t - close_start >= settle)
     open_start = task.segment_end_times[Phase.PLACE]
     for phase, t, closed, hold in in_phase(Phase.OPEN):

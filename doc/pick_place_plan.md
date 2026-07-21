@@ -29,6 +29,7 @@ unchanged. Everything new lives in the task layer.
 | 2026-07-10 | **P2 CLOSED (user decision — no further grid work).** P-A3 grid 25/28: q0/cube/friction axes all green; the mass axis drove three fixes now in the code (stall-engagement gating on `transition_q_tolerance`, `place_offset` z 0.002, time budget 2.0× duration). Final state: nominal + mass 1.1 pass every gate (placed 1.9/3.9 mm); mass 0.9 is a documented envelope edge (16.8 mm placement at −10 % global mass — the heavier direction, the real-deployment one, passes). `solve_mean` ~31–32 ms is the genuine pick-place number (GPU uncontended, user-confirmed) vs the inherited 30 ms gate — fine against the 40 ms/25 Hz deadline. Config frozen as committed in `configs/pick_place.yaml`. |
 | 2026-07-10 | **P3 design (user-approved).** (1) **One `control_msgs/GripperCommand` action client** for both backends — the agimus gripper node serves the same action type (`/fer_gripper/gripper_action`) and internally maps close→grasp(force)/open→move, so the action *name* is the only per-backend difference (a bridge parameter). (2) **Dwell-exit waits on the action result by freezing the plan clock in the adapter** (skip `pm.update` while a gripper action is in flight): mid-dwell everything is constant, so the pause is indistinguishable from a longer dwell and the certified task layer stays untouched. (3) **Task selection reuses `planner_ocp`** in `hydrax_bridge.yaml` (yaml key + install rebuild, the `planner_mode` precedent): `pick_place` makes the adapter load `load_pick_place_config` + `PandaPickPlace` + the phase machine; default path stays pregrasp-compatible. The dwell impedance needs **zero bridge changes**: the adapter flips `diagnostics.gain_mode` per cycle (motion → `exact_feedback`, K from the solve anchored at x₀; hold → `feedforward`, fixed impedance K with `reference_q/v` = the dwell goal, which the existing bridge substitution anchors on the reference). Gripper action goal *values* (close/open positions, effort) are ROS-side deployment wiring like the existing `max_effort` in `franka_controllers.yaml`; sim defaults certified now, real values set in P4 staging. P-B2 measures the cube from mujoco_ros2_control's built-in free-joint odometry (`odom_free_joint_name: object_joint` hardware param — no custom code). |
 | 2026-07-16 | **Sim gripper controller = servo-equivalent PID (user decision, after P-B2 diagnosis).** The inherited agimus-demos `gripper_action_controller` gains were written for their stack (on the real robot the grasp runs through `agimus_franka_gripper`, never this controller) and failed P-B2 three measured ways: stall threshold 0.001 sat on the grip-noise floor (close took 11 s → tripped the 10 s bridge backstop — the user-reported timeout); p=20 squeezes 0.4 N at the grasp (cube 0.49 N slipped out 3 mm into LIFT); the open stalled 3.8 mm short of goal_tolerance 0.001 and failed release verification. Fix: p=350/d=10/i=0 — algebraically the Tier A `actuator8` servo law (gainprm 350, biasprm 0 −350 −10, ~7 N squeeze) whose grasp physics P-A2/P-A3 certified — plus goal_tolerance 0.005 and stall_velocity_threshold 0.005. Rejected alternative: literal actuator8 swap (model+xacro+controller type — same physics, more moving parts). |
+| 2026-07-21 | **One gain calculation throughout exact-feedback execution (user-approved after ROS MuJoCo A/B).** The automatic exact-feedback→fixed-impedance override at grasp/place precision windows is removed from both the ROS adapter and direct Hydrax example. `planner_mode=exact_feedback` now always publishes the solve's F-MPPI K anchored at x₀; `feedforward` remains the explicit whole-run fixed-impedance mode. In the paired ROS run, Feedback-MPPI-only completed PREGRASP→DONE, verified close, lifted the cube 158 mm with 10.2 mm cube-to-EE drift, and reached TRANSPORT with zero rejected outputs/deadline misses. It removed all K≈2000 packets and reduced the precision-window requested-effort step from 28.4 to 0.51 Nm in norm. Close EE error increased from 3.2 to 7.2 mm but remained within the grasp criterion. Placement remained inaccurate in both runs (108.6 vs 81.7 mm), so this decision certifies the grasp/lift law choice, not the later placement behavior. `precision_hold` is retained as a diagnostic precision-window marker only. This supersedes the 2026-07-09 dwell-law decision without erasing its historical measurements. |
 | 2026-07-09 | **Tier A plant derivation (settled after two rejected drafts; file names superseded by the consolidation row above).** The user requires an articulated, movable gripper in Tier A (a no-grasp-physics simplification was rejected once the pregrasp models' frozen fingers were surfaced) but not a copy of the ROS model files. Final: `pick_place.xml` derives from `sbmpc/models/panda_pick_place/panda.xml` — the same parent `pregrasp.xml` was generated from, so arm parity with the planning model is inherited — with only the 7 arm position actuators swapped for the pregrasp torque motors; fingers, tendon-equality coupling and the position-servo gripper `actuator8` kept. The **planning model stays `pregrasp.xml` unchanged** (the MPPI plans the arm; the plant does the grasping). Plant timestep is 0.001 (deployment rate): the sbmpc original's 0.005 planning timestep is measurably unstable as a plant (arm falls within 1 s under exact gravity comp; the fer scene at 0.001 holds exactly). Place-target default in front of the robot (0.65, 0, 0.025), per user. |
 
 ## Non-goals
@@ -150,34 +151,33 @@ q/v/u errors, weights 1.0/0.1/0.01) against the active segment; frozen
 solver config (T=0.007, H=0.32 s, it=3, 1024 samples, gain batch 128,
 linear spline, σ=0.03·τ_max) as the starting point, re-gated.
 
-**Deployment law per phase — a P2 measurement, one existing switch.**
-Default is `exact_feedback` end-to-end (what the robot ran). The known
-watch-item: at stationary dwells (CLOSE/OPEN) the exact_feedback hold
-wanders 1–2 cm, which is too much at the grasp instant. Two remedies,
-both already certified and both inside the existing bridge contract:
-1. **impedance dwell blend**: during dwells the adapter publishes the
-   fixed impedance anchored on the (stationary) reference — sub-mm hold,
-   K and `initial_state` are per-cycle planner outputs so no bridge
-   change;
-2. plain `planner_mode: feedforward` for the whole sequence — viable
-   because per-phase replanning removes the reference-start mismatch
-   (see above), at the cost of sidelining the F-MPPI gains.
-P-A2 measures the dwell precision in exact_feedback first; the remedy
-(likely 1) is adopted only if the measurement demands it, and the choice
-is recorded here.
+**Deployment law — one selected mode end-to-end.** `planner_mode` is
+invariant across every motion, boundary wait, and dwell. The deployed
+`exact_feedback` mode always publishes the current solve's F-MPPI K
+anchored at x₀. The explicit `feedforward` mode uses the fixed impedance
+for the whole sequence. `precision_hold` marks the stationary grasp/place
+windows in diagnostics but never changes the gain or anchor.
 
-*Measured and decided (2026-07-09, P-A2):* pure exact_feedback delivered
+*Historical measurement (2026-07-09, P-A2; superseded law choice):*
+pure exact_feedback delivered
 **13.2 mm lateral / 10.7 mm vertical** EE error at the close command —
 the controller's known ~1 cm steady-state precision, insufficient for
-the 1 cm / 5 mm grasp gates. **Remedy 1 adopted**, as the
-settle-then-actuate dwell: for the first `dwell_settle_sec` of each
-dwell the 1 kHz law is the stiff impedance on the (stationary) dwell
-reference, and only then does the gripper actuate (OPEN keeps holding
-the cube through its settle, then releases). Result: **1.5 mm lateral /
-1.0 mm vertical** at the close command, cube placed 8 mm from target —
-P-A2 all 16 gates PASS. In the ROS deployment this is expressible
-per-cycle inside the existing bridge contract (impedance K anchored on
-the reference during dwells), wired in P3.
+the 1 cm / 5 mm grasp gates. **The fixed-impedance dwell override was
+adopted** with settle-then-actuate timing: for the first
+`dwell_settle_sec` of each dwell the 1 kHz law was the stiff impedance on
+the stationary dwell reference, and only then did the gripper actuate.
+Result: **1.5 mm lateral / 1.0 mm vertical** at the close command, cube
+placed 8 mm from target — P-A2 all 16 gates PASS. The 2026-07-21 decision
+above supersedes that automatic override.
+
+*Superseding measurement and decision (2026-07-21, ROS MuJoCo A/B):*
+with the current task, gripper, and ROS control path, exact feedback
+through the precision windows verified the grasp, lifted and retained the
+cube, and reached TRANSPORT. Its 7.2 mm total close error was sufficient,
+while the discontinuous fixed-impedance handover produced a 28.4 Nm
+requested-effort step. The automatic dwell override is therefore removed;
+the OCP and phase gates stay unchanged so the real experiment changes one
+variable. Placement remains a separate open behavior.
 
 ## Validation protocol
 
@@ -214,8 +214,9 @@ report ignored); grasp success required on every run.
 **P-B1 — adapter/bridge contract** (pytest, no ROS runtime): pick-place
 config loads through the same glue (config-match asserts); phase and
 gripper_command semantics (command changes exactly at CLOSE/OPEN entry);
-K/anchor contract per phase, including the impedance dwell blend if
-adopted; gripper action client unit-tested against a fake action server.
+K/anchor contract across every phase, including blocked dwell-entry waits
+and CLOSE/OPEN precision windows; gripper action client unit-tested against
+a fake action server.
 
 **P-B2 — sim bringup, full sequence** (`backend:=mujoco`): the ROS scene
 already contains the cube + target + gripper actuator. Pass: cube placed
@@ -272,11 +273,11 @@ V-A2 4/4, V-B1 10/10).
 
 ## Risks
 
-- **Dwell precision at CLOSE/OPEN** (the exact_feedback stationary-hold
-  wander, 1–2 cm known): two certified remedies inside the existing
-  contract (impedance dwell blend / feedforward mode); measured and
-  decided in P-A2/P2 — a choice between working options, not an open
-  problem.
+- **Dwell precision at CLOSE/OPEN:** the 2026-07-21 ROS A/B showed the
+  current exact-feedback law meets grasp/lift needs without the unsafe
+  fixed-impedance handover. Continue logging EE pose/velocity at close on
+  hardware; `feedforward` remains an explicit whole-run mode, not an
+  automatic phase override.
 - **Contact-free transport mismatch** (cube inertia unmodeled): measure
   in P-A2 by comparing plant-with-cube vs planner-without tracking; the
   cube is light, DR covers it — verify, don't assume.

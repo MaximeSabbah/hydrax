@@ -36,8 +36,9 @@ class PickPlacePhaseDiagnostics:
     """JSON-safe snapshot of the active phase-transition gate.
 
     Joint indices are zero-based. ``transition_status`` describes the
-    current phase boundary, while ``precision_hold`` describes the control
-    law selected for this cycle.
+    current phase boundary, while ``precision_hold`` marks a stationary
+    grasp/place precision window for diagnostics. It does not select the
+    controller gain law.
     """
 
     phase: str
@@ -124,14 +125,11 @@ class PandaPickPlaceOptions:
     # additionally waits for the gripper action result)
     dwell_sec: float = 1.0
 
-    # The dwells are settle-then-actuate: for the first dwell_settle_sec
-    # the arm is pinned by the STIFF IMPEDANCE on the (stationary) dwell
-    # reference — the P2 law schedule, remedy 3 of the precision ladder:
-    # P-A2 measured 13 mm EE error at the grasp in pure exact_feedback
-    # (its certified steady-state precision is ~1 cm), while the impedance
-    # holds sub-mm — and only then does the gripper actuate. During OPEN's
-    # settle the gripper stays closed (settle at the place pose while
-    # holding, then release).
+    # The dwells are settle-then-actuate: the reference remains stationary
+    # for the first dwell_settle_sec before the gripper actuates. The
+    # controller mode and gain calculation remain unchanged throughout.
+    # During OPEN's settle the gripper stays closed (settle at the place
+    # pose while holding, then release).
     dwell_settle_sec: float = 0.5
 
     # Segment-boundary transition gates: the plan clock crosses into the
@@ -352,12 +350,10 @@ class PickPlacePhaseMachine:
         # kept a python float: an np.float64 leaking into state.time
         # changes the traced dtype and silently recompiles the solver
         self.plan_time = 0.0
-        # set while holding at a dwell-entry boundary: under model
-        # mismatch exact_feedback's steady sag (0.034 rad measured at
-        # P-A3 mass 1.1) exceeds the 0.02 rad precision gate it is asked
-        # to satisfy — a deadlock only the impedance (residual ~
-        # mismatch/kp ~ 0.002 rad) can break, so the precision hold
-        # engages during the wait, not just inside the dwell
+        # Set during the final wait at a dwell-entry boundary, once the arm
+        # is inside the ordinary arrival tolerance but has not yet passed
+        # the tighter grasp/place gate. This drives diagnostics only; it
+        # never requests a different gain law.
         self._stalled_at_dwell_entry = False
 
     @property
@@ -368,7 +364,7 @@ class PickPlacePhaseMachine:
     @property
     def gripper_closed(self) -> bool:
         phase = self.phase
-        if phase == Phase.CLOSE:  # actuates after the impedance settle
+        if phase == Phase.CLOSE:  # actuates after the stationary settle
             return self._time_into_phase() >= self._settle
         if phase == Phase.OPEN:  # holds through the settle, then releases
             return self._time_into_phase() < self._settle
@@ -376,9 +372,11 @@ class PickPlacePhaseMachine:
 
     @property
     def precision_hold(self) -> bool:
-        """True while the 1 kHz law must be the stiff impedance: the
-        stationary dwells and the waits at their entry boundaries — the
-        grasp/place precision windows."""
+        """Mark stationary grasp/place precision windows for diagnostics.
+
+        This is true during dwells and the final waits at their entry
+        boundaries. The selected controller law remains unchanged.
+        """
         return self.phase in _DWELL_PHASES or self._stalled_at_dwell_entry
 
     def _time_into_phase(self) -> float:
@@ -487,13 +485,9 @@ class PickPlacePhaseMachine:
             self._stalled_at_dwell_entry = False
         else:
             self.plan_time = float(boundary)  # hold the segment goal
-            # The impedance engages only once exact_feedback has decayed
-            # the arrival lag to the ordinary transition tolerance:
-            # engaging on the first hold cycle (arrival lag ~0.1 rad
-            # under mismatch) yanks — kp x 0.1 rad exceeds the torque
-            # and velocity margins (measured). Within +-0.05 rad the
-            # engagement is V-A5-certified safe, and the impedance
-            # closes the precision leg (0.05 -> ~0.002 rad).
+            # Mark only the final precision wait near a dwell entry, not a
+            # far-away arrival stall. The bridge logs this distinction but
+            # keeps the configured gain law unchanged.
             q_err = np.abs(np.asarray(q) - self._goals[phase]).max()
             self._stalled_at_dwell_entry = (
                 Phase(phase + 1) in _DWELL_PHASES and q_err <= self._q_tol

@@ -246,7 +246,6 @@ active = {
     "q_des": plan_q[0],
     "v_des": plan_v[0],
     "K": None,
-    "hold": False,
 }
 grip_prev = False
 grip_events: dict[str, dict] = {}
@@ -314,10 +313,6 @@ while k < max_steps:
             "q_des": plan_q[i_ref],
             "v_des": plan_v[i_ref],
             "K": None,
-            # dwells run under the stiff impedance (the P2 law schedule):
-            # the reference is stationary there, so the certified
-            # feedforward-mode law applies and holds sub-mm
-            "hold": pm.precision_hold,
         }
         nan_seen |= not np.all(np.isfinite(active["tau_ff"]))
         if args.mode == "feedback":
@@ -333,7 +328,7 @@ while k < max_steps:
     # The 1 kHz LFC law on the arm, zero-order-held planner outputs.
     # Unclipped demand, as in the pregrasp example: the torque margin
     # must see what the real robot's reflexes would see.
-    if active["K"] is not None and not active["hold"]:
+    if active["K"] is not None:
         dx = np.concatenate(
             [mj_data.qpos[:7] - active["q0"], mj_data.qvel[:7] - active["v0"]]
         )

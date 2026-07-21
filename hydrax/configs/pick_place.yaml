@@ -36,7 +36,7 @@ plan:
   max_velocity_fraction: 0.20
   min_segment_sec: 1.5
   dwell_sec: 1.0
-  dwell_settle_sec: 0.5 # impedance-settle before the gripper actuates
+  dwell_settle_sec: 0.5 # stationary settle before the gripper actuates
   transition_q_tolerance: 0.05 # rad; must exceed the ~0.02-0.03 rad hold wander
   transition_v_tolerance: 0.15 # rad/s
   precision_q_tolerance: 0.02 # rad; the DESCEND->CLOSE / PLACE->OPEN gates
