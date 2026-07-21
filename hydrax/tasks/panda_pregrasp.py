@@ -29,9 +29,9 @@ class PandaPregraspOptions:
 
     # --- Task geometry ---
 
-    # Pregrasp position: 5 cm above the pick-and-place scene's object
-    # (object top at z = 0.05)
-    goal_pos: Tuple[float, float, float] = (0.5, 0.0, 0.10)
+    # Pregrasp position: 7.5 cm above the pick-and-place scene's canonical
+    # cube-center safety reference (z = 0.105 m).
+    goal_pos: Tuple[float, float, float] = (0.5, 0.0, 0.18)
 
     # Pregrasp orientation (rotation matrix rows): gripper pointing down,
     # x-axis along world x

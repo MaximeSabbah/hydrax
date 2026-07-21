@@ -6,6 +6,9 @@ goals, the yaml loader, and the event-gated plan clock. The controller
 itself is the certified pregrasp machinery and is gated by P-A2.
 """
 
+import json
+from dataclasses import asdict
+
 import mujoco
 import numpy as np
 import pytest
@@ -33,8 +36,8 @@ def test_yaml_loads_into_the_typed_schema():
     assert config.spline_type == "linear"
     assert config.plan_horizon == 0.32
     assert options.transition_q_tolerance == 0.05
-    assert options.cube_pos == [0.5, 0.0, 0.025]
-    assert options.target_pos == [0.65, 0.0, 0.025]
+    assert options.cube_pos == [0.5, 0.0, 0.105]
+    assert options.target_pos == [0.65, 0.0, 0.105]
 
 
 def test_timeline_chains_the_phase_goals(task):
@@ -81,13 +84,13 @@ def test_phase_goals_reach_the_configured_poses(task):
 
 def test_phase_goals_follow_the_measured_cube_pose():
     shifted = PandaPickPlace(
-        options=PandaPickPlaceOptions(cube_pos=(0.52, -0.03, 0.025))
+        options=PandaPickPlaceOptions(cube_pos=(0.52, -0.03, 0.105))
     )
     data = mujoco.MjData(shifted.mj_model)
     sid = mujoco.mj_name2id(shifted.mj_model, mujoco.mjtObj.mjOBJ_SITE, "gripper")
     data.qpos[:] = shifted.phase_goal_q[Phase.DESCEND]
     mujoco.mj_forward(shifted.mj_model, data)
-    assert np.linalg.norm(data.site_xpos[sid] - [0.52, -0.03, 0.025]) < 1e-3
+    assert np.linalg.norm(data.site_xpos[sid] - [0.52, -0.03, 0.105]) < 1e-3
 
 
 def test_clock_walks_the_sequence_when_converged(task):
@@ -141,6 +144,110 @@ def test_dwell_entries_use_the_precision_tolerance(task):
     pm.update(task.phase_goal_q[Phase.DESCEND] + 0.01, np.zeros(7))
     pm.update(task.phase_goal_q[Phase.DESCEND] + 0.01, np.zeros(7))
     assert pm.phase == Phase.CLOSE
+
+
+def test_diagnostics_identifies_the_pregrasp_joint_position_blocker(task):
+    pm = PickPlacePhaseMachine(task)
+    pm.plan_time = float(task.segment_end_times[Phase.PREGRASP])
+    q = np.asarray(task.phase_goal_q[Phase.PREGRASP]).copy()
+    q[3] += 0.06
+    v = np.zeros(7)
+
+    state_before = (pm.plan_time, pm.precision_hold, pm.gripper_closed)
+    snapshot = pm.diagnostics_snapshot(q, v)
+
+    assert snapshot.phase == "PREGRASP"
+    assert snapshot.next_phase == "DESCEND"
+    assert snapshot.gate_type == "state"
+    assert snapshot.at_boundary
+    assert snapshot.time_to_boundary_sec == 0.0
+    assert snapshot.transition_status == "blocked_q"
+    assert snapshot.transition_blocked
+    assert snapshot.q_error_max_rad == pytest.approx(0.06)
+    assert snapshot.q_error_joint_index == 3
+    assert snapshot.q_error_signed_by_joint_rad[3] == pytest.approx(0.06)
+    assert snapshot.q_tolerance_rad == pytest.approx(0.05)
+    assert snapshot.q_ok is False
+    assert snapshot.velocity_abs_max_rad_s == 0.0
+    assert snapshot.velocity_ok is True
+    assert not snapshot.precision_hold
+    assert snapshot.gripper_command == "open"
+
+    # A snapshot is observational: it neither advances the event clock nor
+    # changes the controller/gripper schedule. It must also serialize with
+    # strict JSON (no NumPy scalar or NaN leakage into ROS diagnostics).
+    assert (pm.plan_time, pm.precision_hold, pm.gripper_closed) == state_before
+    payload = json.loads(json.dumps(asdict(snapshot), allow_nan=False))
+    assert payload["q_error_joint_index"] == 3
+    assert payload["q_error_signed_by_joint_rad"][3] == pytest.approx(0.06)
+
+
+def test_diagnostics_identifies_the_pregrasp_velocity_blocker(task):
+    pm = PickPlacePhaseMachine(task)
+    pm.plan_time = float(task.segment_end_times[Phase.PREGRASP])
+    q = np.asarray(task.phase_goal_q[Phase.PREGRASP]).copy()
+    v = np.zeros(7)
+    v[5] = -0.16
+
+    snapshot = pm.diagnostics_snapshot(q, v)
+
+    assert snapshot.transition_status == "blocked_v"
+    assert snapshot.gate_type == "state"
+    assert snapshot.transition_blocked
+    assert snapshot.q_error_max_rad == pytest.approx(0.0)
+    assert snapshot.q_ok is True
+    assert snapshot.velocity_by_joint_rad_s[5] == pytest.approx(-0.16)
+    assert snapshot.velocity_abs_max_rad_s == pytest.approx(0.16)
+    assert snapshot.velocity_joint_index == 5
+    assert snapshot.velocity_tolerance_rad_s == pytest.approx(0.15)
+    assert snapshot.velocity_ok is False
+
+
+def test_diagnostics_reports_the_tighter_descend_precision_gate(task):
+    pm = PickPlacePhaseMachine(task)
+    pm.plan_time = float(task.segment_end_times[Phase.DESCEND])
+    q = np.asarray(task.phase_goal_q[Phase.DESCEND]).copy()
+    q[2] += 0.03
+
+    # One update at the boundary records the precision-hold schedule used to
+    # close the remaining 0.03 -> 0.02 rad leg on the real controller.
+    pm.update(q, np.zeros(7))
+    snapshot = pm.diagnostics_snapshot(q, np.zeros(7))
+
+    assert snapshot.phase == "DESCEND"
+    assert snapshot.next_phase == "CLOSE"
+    assert snapshot.gate_type == "state"
+    assert snapshot.at_boundary
+    assert snapshot.transition_status == "blocked_q"
+    assert snapshot.q_error_max_rad == pytest.approx(0.03)
+    assert snapshot.q_error_joint_index == 2
+    assert snapshot.q_tolerance_rad == pytest.approx(0.02)
+    assert snapshot.q_ok is False
+    assert snapshot.velocity_ok is True
+    assert snapshot.precision_hold
+    assert snapshot.gripper_command == "open"
+
+
+def test_diagnostics_marks_dwell_boundaries_as_time_only(task):
+    pm = PickPlacePhaseMachine(task)
+    pm.plan_time = float(task.segment_end_times[Phase.CLOSE])
+    q_far = np.asarray(task.phase_goal_q[Phase.CLOSE]) + 0.5
+    v_fast = np.full(7, 1.0)
+
+    snapshot = pm.diagnostics_snapshot(q_far, v_fast)
+
+    assert snapshot.phase == "CLOSE"
+    assert snapshot.next_phase == "LIFT"
+    assert snapshot.gate_type == "time_only"
+    assert snapshot.at_boundary
+    assert snapshot.transition_status == "time_only"
+    assert not snapshot.transition_blocked
+    assert snapshot.q_tolerance_rad is None
+    assert snapshot.velocity_tolerance_rad_s is None
+    assert snapshot.q_ok is None
+    assert snapshot.velocity_ok is None
+    assert snapshot.precision_hold
+    assert snapshot.gripper_command == "close"
 
 
 def test_gripper_schedule_settles_then_actuates(task):

@@ -42,8 +42,10 @@
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"
      contype="1" conaffinity="1"/>
 
-    <!-- Object to pick up -->
-    <body name="object" pos="0.5 0.0 0.025">
+    <!-- Dynamic object at the real-robot table-clearance safety reference.
+         Body gravity compensation intentionally makes the cube conceptually
+         float: this plant validates grasp/transport, not table collisions. -->
+    <body name="object" pos="0.5 0.0 0.105" gravcomp="1">
       <freejoint name="object_joint"/>
       <geom type="box" name="object_geom" size="0.02 0.02 0.025"
        mass="0.05" condim="4"
@@ -53,7 +55,7 @@
     </body>
 
     <!-- Target placement position (mocap, user-draggable) -->
-    <body mocap="true" name="target" pos="0.65 0.0 0.025">
+    <body mocap="true" name="target" pos="0.65 0.0 0.105">
       <geom type="box" size="0.02 0.02 0.025" rgba="1 0.2 0.2 0.3"
        contype="0" conaffinity="0"/>
     </body>
@@ -77,7 +79,7 @@
     <!-- Neutral / folded config: EE points straight down -->
     <key name="home"
       qpos="0 -0.785 0 -2.356 0 1.571 0.785 0.04 0.04
-            0.5 0.0 0.025 1 0 0 0"
+            0.5 0.0 0.105 1 0 0 0"
       ctrl="0.0 -4.0002579 -0.6437449 22.0221667 0.6338477 2.2781773 -0.0 0.04"/>
   </keyframe>
 </mujoco>

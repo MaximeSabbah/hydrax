@@ -31,6 +31,39 @@ _GRIPPER_CLOSED_PHASES = (Phase.CLOSE, Phase.LIFT, Phase.TRANSPORT, Phase.PLACE)
 _DWELL_PHASES = (Phase.CLOSE, Phase.OPEN)
 
 
+@dataclass(frozen=True, slots=True)
+class PickPlacePhaseDiagnostics:
+    """JSON-safe snapshot of the active phase-transition gate.
+
+    Joint indices are zero-based. ``transition_status`` describes the
+    current phase boundary, while ``precision_hold`` describes the control
+    law selected for this cycle.
+    """
+
+    phase: str
+    next_phase: str | None
+    gate_type: str
+    plan_time_sec: float
+    phase_elapsed_sec: float
+    boundary_time_sec: float | None
+    time_to_boundary_sec: float | None
+    at_boundary: bool
+    transition_status: str
+    transition_blocked: bool
+    q_error_signed_by_joint_rad: tuple[float, ...]
+    q_error_max_rad: float
+    q_error_joint_index: int
+    q_tolerance_rad: float | None
+    q_ok: bool | None
+    velocity_by_joint_rad_s: tuple[float, ...]
+    velocity_abs_max_rad_s: float
+    velocity_joint_index: int
+    velocity_tolerance_rad_s: float | None
+    velocity_ok: bool | None
+    precision_hold: bool
+    gripper_command: str
+
+
 @dataclass
 class PandaPickPlaceOptions:
     """Configuration options for the PandaPickPlace task."""
@@ -43,11 +76,13 @@ class PandaPickPlaceOptions:
 
     # --- Task geometry ---
 
-    # Cube and placement poses, measured by hand on the real setup
-    # (deployment decision 2026-07-09: fixed config values, no perception).
-    # Defaults match the scene.xml bodies.
-    cube_pos: Tuple[float, float, float] = (0.5, 0.0, 0.025)
-    target_pos: Tuple[float, float, float] = (0.65, 0.0, 0.025)
+    # Cube and placement poses on the real setup (deployment decision
+    # 2026-07-09: fixed config values, no perception). The 0.105 m z value
+    # is the reviewed table-clearance safety reference. The MuJoCo plant
+    # keeps its dynamic cube at that height with body gravity compensation;
+    # it deliberately does not model or certify table collisions.
+    cube_pos: Tuple[float, float, float] = (0.5, 0.0, 0.105)
+    target_pos: Tuple[float, float, float] = (0.65, 0.0, 0.105)
 
     # EE goal offsets from the cube/target centers, per phase. The grasp
     # offset is zero: the gripper site sits between the finger pads, so
@@ -351,6 +386,91 @@ class PickPlacePhaseMachine:
         start = float(self._end_times[phase - 1]) if phase > 0 else 0.0
         return self.plan_time - start
 
+    def diagnostics_snapshot(
+        self, q: np.ndarray, v: np.ndarray
+    ) -> PickPlacePhaseDiagnostics:
+        """Report the exact measured errors and tolerances used by the gate."""
+        phase = self.phase
+        next_phase = None if phase == Phase.DONE else Phase(phase + 1).name
+        goal_phase = min(phase, Phase.RETREAT)
+        q_err, q_joint, v_err, v_joint = self._state_errors(
+            q, v, goal_phase
+        )
+        q_error_signed_by_joint = tuple(
+            float(value)
+            for value in (
+                np.asarray(q, dtype=np.float64).reshape(-1)
+                - self._goals[goal_phase]
+            )
+        )
+        velocity_by_joint = tuple(
+            float(value)
+            for value in np.asarray(v, dtype=np.float64).reshape(-1)
+        )
+
+        if phase == Phase.DONE:
+            gate_type = "done"
+            boundary = None
+            time_to_boundary = None
+            at_boundary = False
+            q_tol = None
+            v_tol = None
+            q_ok = None
+            v_ok = None
+            status = "done"
+        else:
+            boundary = float(self._end_times[phase])
+            time_to_boundary = max(0.0, boundary - self.plan_time)
+            at_boundary = self.plan_time >= boundary
+            if phase in _DWELL_PHASES:
+                gate_type = "time_only"
+                q_tol = None
+                v_tol = None
+                q_ok = None
+                v_ok = None
+                status = "time_only"
+            else:
+                gate_type = "state"
+                q_tol = self._transition_q_tolerance(phase)
+                v_tol = self._v_tol
+                q_ok = q_err <= q_tol
+                v_ok = v_err <= v_tol
+                if not at_boundary:
+                    status = "tracking"
+                elif not q_ok and not v_ok:
+                    status = "blocked_q_and_v"
+                elif not q_ok:
+                    status = "blocked_q"
+                elif not v_ok:
+                    status = "blocked_v"
+                else:
+                    status = "ready"
+
+        return PickPlacePhaseDiagnostics(
+            phase=phase.name,
+            next_phase=next_phase,
+            gate_type=gate_type,
+            plan_time_sec=float(self.plan_time),
+            phase_elapsed_sec=float(self._time_into_phase()),
+            boundary_time_sec=boundary,
+            time_to_boundary_sec=time_to_boundary,
+            at_boundary=bool(at_boundary),
+            transition_status=status,
+            transition_blocked=status.startswith("blocked_"),
+            q_error_signed_by_joint_rad=q_error_signed_by_joint,
+            q_error_max_rad=q_err,
+            q_error_joint_index=q_joint,
+            q_tolerance_rad=q_tol,
+            q_ok=q_ok,
+            velocity_by_joint_rad_s=velocity_by_joint,
+            velocity_abs_max_rad_s=v_err,
+            velocity_joint_index=v_joint,
+            velocity_tolerance_rad_s=v_tol,
+            velocity_ok=v_ok,
+            precision_hold=bool(self.precision_hold),
+            gripper_command="close" if self.gripper_closed else "open",
+        )
+
     def update(self, q: np.ndarray, v: np.ndarray) -> float:
         """Advance the plan clock by one control period; returns it."""
         phase = self.phase
@@ -381,12 +501,32 @@ class PickPlacePhaseMachine:
         return self.plan_time
 
     def _converged(self, q: np.ndarray, v: np.ndarray, phase: Phase) -> bool:
-        # boundaries entering a dwell are the grasp/place precision
-        q_tol = (
+        q_tol = self._transition_q_tolerance(phase)
+        q_err, _, v_err, _ = self._state_errors(q, v, phase)
+        return q_err <= q_tol and v_err <= self._v_tol
+
+    def _transition_q_tolerance(self, phase: Phase) -> float:
+        """Return the joint-position tolerance at a motion boundary."""
+        return (
             self._precision_q_tol
             if Phase(phase + 1) in _DWELL_PHASES
             else self._q_tol
         )
-        q_err = np.abs(np.asarray(q) - self._goals[phase]).max()
-        v_err = np.abs(np.asarray(v)).max()
-        return q_err <= q_tol and v_err <= self._v_tol
+
+    def _state_errors(
+        self, q: np.ndarray, v: np.ndarray, goal_phase: Phase
+    ) -> tuple[float, int, float, int]:
+        """Return maximum errors and their zero-based joint indices."""
+        q_error = np.abs(
+            np.asarray(q, dtype=np.float64).reshape(-1)
+            - self._goals[goal_phase]
+        )
+        velocity = np.abs(np.asarray(v, dtype=np.float64).reshape(-1))
+        q_joint = int(np.argmax(q_error))
+        v_joint = int(np.argmax(velocity))
+        return (
+            float(q_error[q_joint]),
+            q_joint,
+            float(velocity[v_joint]),
+            v_joint,
+        )

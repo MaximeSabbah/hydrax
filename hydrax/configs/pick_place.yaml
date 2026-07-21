@@ -41,10 +41,12 @@ plan:
   transition_v_tolerance: 0.15 # rad/s
   precision_q_tolerance: 0.02 # rad; the DESCEND->CLOSE / PLACE->OPEN gates
 
-# Cube and placement poses, measured BY HAND on the real setup before a
+# Cube and placement x/y are measured BY HAND on the real setup before a
 # session (deployment decision 2026-07-09: fixed values, no perception).
-# Defaults match the scene.xml bodies; the P-A3 grid certifies a ±1 cm
-# neighborhood around them.
+# z=0.105 m is the reviewed table-clearance safety reference. The MuJoCo
+# plant uses a gravity-compensated dynamic cube at this height and therefore
+# does not model or certify table collisions. Defaults match scene.xml; the
+# P-A3 grid certifies a ±1 cm neighborhood around the configured poses.
 geometry:
   cube_pos: [0.5, 0.0, 0.105]
   target_pos: [0.65, 0.0, 0.105]

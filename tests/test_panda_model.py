@@ -66,13 +66,21 @@ def test_plant_scene_grasps_and_holds(plant) -> None:
     assert plant.nq == 16 and plant.nu == 8  # arm + fingers + cube
     assert plant.opt.timestep == 0.001  # the 1 kHz deployment rate
     assert plant.body("target").mocapid[0] >= 0
+    object_body_id = mujoco.mj_name2id(
+        plant, mujoco.mjtObj.mjOBJ_BODY, "object"
+    )
+    assert plant.body_gravcomp[object_body_id] == pytest.approx(1.0)
+    assert plant.body("object").pos == pytest.approx([0.5, 0.0, 0.105])
+    assert plant.body("target").pos == pytest.approx([0.65, 0.0, 0.105])
     data = mujoco.MjData(plant)
     mujoco.mj_resetDataKeyframe(plant, data, 0)
     for _ in range(1000):
         mujoco.mj_step(plant, data)
-    # gravity-comp keyframe ctrl holds the arm; the cube rests on the floor
+    # Gravity compensation holds both the arm and the deliberately floating
+    # dynamic cube at their keyframe poses without a simulated table.
     assert np.abs(data.qpos[:7] - plant.key("home").qpos[:7]).max() < 1e-3
     assert np.abs(data.qpos[9:12] - plant.key("home").qpos[9:12]).max() < 1e-3
+    assert data.qpos[9:12] == pytest.approx([0.5, 0.0, 0.105], abs=1e-6)
     # the gripper actuates: ctrl[7] is the finger width servo
     data.ctrl[7] = 0.0
     for _ in range(1000):
