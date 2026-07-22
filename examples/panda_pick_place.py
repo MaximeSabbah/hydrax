@@ -196,6 +196,7 @@ if args.cube_friction is not None:
 mj_data = mujoco.MjData(mj_model)
 mujoco.mj_resetDataKeyframe(mj_model, mj_data, 0)
 site_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_SITE, "gripper")
+ee_spatial_velocity = np.empty(6, dtype=np.float64)
 CUBE_Q = slice(9, 12)  # cube free-joint position in the plant qpos
 if args.q0_noise is not None:
     # only the PLANT starts off the plan (hand-placed robot); the
@@ -213,6 +214,7 @@ if args.cube_noise is not None:
     mj_data.qpos[9:11] += np.random.default_rng(args.cube_seed).uniform(
         -args.cube_noise, args.cube_noise, 2
     )
+mujoco.mj_forward(mj_model, mj_data)
 
 plan_q = np.asarray(task.reference_qpos)
 plan_v = np.asarray(task.reference_qvel)
@@ -274,14 +276,33 @@ while k < max_steps:
 
     if k % steps_per_cycle == 0:
         q_arm, v_arm = mj_data.qpos[:7].copy(), mj_data.qvel[:7].copy()
+        ee_position = mj_data.site_xpos[site_id].copy()
+        ee_rotation = mj_data.site_xmat[site_id].reshape(3, 3).copy()
+        mujoco.mj_objectVelocity(
+            mj_model,
+            mj_data,
+            mujoco.mjtObj.mjOBJ_SITE,
+            site_id,
+            ee_spatial_velocity,
+            0,
+        )
+        ee_angular_velocity = ee_spatial_velocity[:3]
+        ee_linear_velocity = ee_spatial_velocity[3:]
         prev_phase = pm.phase
-        pm.update(q_arm, v_arm)
+        pm.update(
+            q_arm,
+            v_arm,
+            ee_position,
+            ee_rotation,
+            ee_linear_velocity,
+            ee_angular_velocity,
+        )
         if pm.phase != prev_phase:
             # record the plant state at each phase entry (the precision
             # gates read the CLOSE/OPEN entries)
             phase_entries[pm.phase.name] = {
                 "t": t,
-                "ee": mj_data.site_xpos[site_id].copy(),
+                "ee": ee_position,
                 "cube": mj_data.qpos[CUBE_Q].copy(),
             }
             print(
@@ -295,7 +316,7 @@ while k < max_steps:
             # the gripper-command instants ARE the grasp/place precision
             grip_events["close" if pm.gripper_closed else "open"] = {
                 "t": t,
-                "ee": mj_data.site_xpos[site_id].copy(),
+                "ee": ee_position,
                 "cube": mj_data.qpos[CUBE_Q].copy(),
             }
             grip_prev = pm.gripper_closed

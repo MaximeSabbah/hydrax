@@ -30,6 +30,7 @@ unchanged. Everything new lives in the task layer.
 | 2026-07-10 | **P3 design (user-approved).** (1) **One `control_msgs/GripperCommand` action client** for both backends — the agimus gripper node serves the same action type (`/fer_gripper/gripper_action`) and internally maps close→grasp(force)/open→move, so the action *name* is the only per-backend difference (a bridge parameter). (2) **Dwell-exit waits on the action result by freezing the plan clock in the adapter** (skip `pm.update` while a gripper action is in flight): mid-dwell everything is constant, so the pause is indistinguishable from a longer dwell and the certified task layer stays untouched. (3) **Task selection reuses `planner_ocp`** in `hydrax_bridge.yaml` (yaml key + install rebuild, the `planner_mode` precedent): `pick_place` makes the adapter load `load_pick_place_config` + `PandaPickPlace` + the phase machine; default path stays pregrasp-compatible. The dwell impedance needs **zero bridge changes**: the adapter flips `diagnostics.gain_mode` per cycle (motion → `exact_feedback`, K from the solve anchored at x₀; hold → `feedforward`, fixed impedance K with `reference_q/v` = the dwell goal, which the existing bridge substitution anchors on the reference). Gripper action goal *values* (close/open positions, effort) are ROS-side deployment wiring like the existing `max_effort` in `franka_controllers.yaml`; sim defaults certified now, real values set in P4 staging. P-B2 measures the cube from mujoco_ros2_control's built-in free-joint odometry (`odom_free_joint_name: object_joint` hardware param — no custom code). |
 | 2026-07-16 | **Sim gripper controller = servo-equivalent PID (user decision, after P-B2 diagnosis).** The inherited agimus-demos `gripper_action_controller` gains were written for their stack (on the real robot the grasp runs through `agimus_franka_gripper`, never this controller) and failed P-B2 three measured ways: stall threshold 0.001 sat on the grip-noise floor (close took 11 s → tripped the 10 s bridge backstop — the user-reported timeout); p=20 squeezes 0.4 N at the grasp (cube 0.49 N slipped out 3 mm into LIFT); the open stalled 3.8 mm short of goal_tolerance 0.001 and failed release verification. Fix: p=350/d=10/i=0 — algebraically the Tier A `actuator8` servo law (gainprm 350, biasprm 0 −350 −10, ~7 N squeeze) whose grasp physics P-A2/P-A3 certified — plus goal_tolerance 0.005 and stall_velocity_threshold 0.005. Rejected alternative: literal actuator8 swap (model+xacro+controller type — same physics, more moving parts). |
 | 2026-07-21 | **One gain calculation throughout exact-feedback execution (user-approved after ROS MuJoCo A/B).** The automatic exact-feedback→fixed-impedance override at grasp/place precision windows is removed from both the ROS adapter and direct Hydrax example. `planner_mode=exact_feedback` now always publishes the solve's F-MPPI K anchored at x₀; `feedforward` remains the explicit whole-run fixed-impedance mode. In the paired ROS run, Feedback-MPPI-only completed PREGRASP→DONE, verified close, lifted the cube 158 mm with 10.2 mm cube-to-EE drift, and reached TRANSPORT with zero rejected outputs/deadline misses. It removed all K≈2000 packets and reduced the precision-window requested-effort step from 28.4 to 0.51 Nm in norm. Close EE error increased from 3.2 to 7.2 mm but remained within the grasp criterion. Placement remained inaccurate in both runs (108.6 vs 81.7 mm), so this decision certifies the grasp/lift law choice, not the later placement behavior. `precision_hold` is retained as a diagnostic precision-window marker only. This supersedes the 2026-07-09 dwell-law decision without erasing its historical measurements. |
+| 2026-07-21 | **Phase success is fixed EE pose + steadiness, not a tunable joint gate (user decision after the first instrumented real run).** The real PREGRASP hold reached 4.4 mm EE error but retained a 0.0527 rad joint-5 offset, just outside the obsolete 0.05 rad joint tolerance; the state machine therefore never entered DESCEND and correctly never sent a gripper goal. Motion transitions now require the measured EE pose and Cartesian twist to satisfy a fixed code-level task contract for five consecutive 25 Hz planner samples. The two gripper-action boundaries share the same 10 mm action-pose bound; placement is not loosened merely to finish simulation. Joint position/velocity remain fully logged but cannot block progress. All acceptance keys were removed from `pick_place.yaml` and rejected by its schema. The OCP, gain computation, and 25 Hz/1 kHz control laws are unchanged. |
 | 2026-07-09 | **Tier A plant derivation (settled after two rejected drafts; file names superseded by the consolidation row above).** The user requires an articulated, movable gripper in Tier A (a no-grasp-physics simplification was rejected once the pregrasp models' frozen fingers were surfaced) but not a copy of the ROS model files. Final: `pick_place.xml` derives from `sbmpc/models/panda_pick_place/panda.xml` — the same parent `pregrasp.xml` was generated from, so arm parity with the planning model is inherited — with only the 7 arm position actuators swapped for the pregrasp torque motors; fingers, tendon-equality coupling and the position-servo gripper `actuator8` kept. The **planning model stays `pregrasp.xml` unchanged** (the MPPI plans the arm; the plant does the grasping). Plant timestep is 0.001 (deployment rate): the sbmpc original's 0.005 planning timestep is measurably unstable as a plant (arm falls within 1 s under exact gravity comp; the fer scene at 0.001 holds exactly). Place-target default in front of the robot (0.65, 0, 0.025), per user. |
 
 ## Non-goals
@@ -83,7 +84,9 @@ hydrax (this fork)
                                              cube/target poses, per-phase
                                              clearance offsets, segment
                                              durations / velocity
-                                             fractions, tolerances, dwells
+                                             fractions and dwells; fixed
+                                             phase-success contract stays
+                                             in task code
   examples/panda_pick_place.py               Tier A multi-rate run
                                              (contactful plant, gripper
                                              actuated, LFC-law loop as in
@@ -132,9 +135,15 @@ min-jerk segments goal-to-goal (velocity-capped, floored at
 feedforward throughout — the pregrasp generator, run once at
 construction), and `PickPlacePhaseMachine` owns `state.time`: the clock
 advances normally inside a segment and refuses to cross a segment
-boundary until the arm has converged on the segment goal (tighter
-`precision_q_tolerance` on the two boundaries entering dwells, where the
-gripper acts). The properties survive:
+boundary until the measured end effector is at the segment goal and
+sufficiently still. Acceptance is task-space only: ordinary motion
+boundaries use a 30 mm / 0.10 rad arrival envelope; the two boundaries
+where the gripper acts share a 10 mm / 0.075 rad action-pose envelope.
+Linear/angular EE speed must remain below 0.060 m/s / 0.20 rad/s for five
+consecutive 25 Hz planner samples. These are reviewed code-level task
+invariants, not YAML tuning. Joint position and velocity are recorded as
+diagnostics only.
+The properties survive:
 - **event-driven progress**: a slow phase stalls the reference on its
   goal instead of being abandoned; each segment starts from a
   converged (measured-to-tolerance) posture, so the impedance law is
@@ -176,8 +185,9 @@ through the precision windows verified the grasp, lifted and retained the
 cube, and reached TRANSPORT. Its 7.2 mm total close error was sufficient,
 while the discontinuous fixed-impedance handover produced a 28.4 Nm
 requested-effort step. The automatic dwell override is therefore removed;
-the OCP and phase gates stay unchanged so the real experiment changes one
-variable. Placement remains a separate open behavior.
+the OCP stayed unchanged for that comparison. The later task-space gate
+correction above also leaves the OCP and gain law untouched. Placement
+remains a separate open behavior.
 
 ## Validation protocol
 

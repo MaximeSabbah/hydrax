@@ -30,16 +30,15 @@ solver:
 
 # The phase timeline: per-segment durations come from the velocity cap
 # (floored by min_segment_sec for gentle precision moves); the plan clock
-# crosses a segment boundary only once the arm is within the transition
-# tolerances of the segment goal (dwells are time-only).
+# crosses a segment boundary only after the fixed task-success contract in
+# panda_pick_place.py is met (EE at the commanded pose and sufficiently still;
+# dwells are time-only). That acceptance contract is intentionally not a YAML
+# tuning surface.
 plan:
   max_velocity_fraction: 0.20
   min_segment_sec: 1.5
   dwell_sec: 1.0
   dwell_settle_sec: 0.5 # stationary settle before the gripper actuates
-  transition_q_tolerance: 0.05 # rad; must exceed the ~0.02-0.03 rad hold wander
-  transition_v_tolerance: 0.15 # rad/s
-  precision_q_tolerance: 0.02 # rad; the DESCEND->CLOSE / PLACE->OPEN gates
 
 # Cube and placement x/y are measured BY HAND on the real setup before a
 # session (deployment decision 2026-07-09: fixed values, no perception).

@@ -75,9 +75,6 @@ _PICK_PLACE_YAML_SCHEMA = {
         "min_segment_sec": ("options", "min_segment_sec"),
         "dwell_sec": ("options", "dwell_sec"),
         "dwell_settle_sec": ("options", "dwell_settle_sec"),
-        "transition_q_tolerance": ("options", "transition_q_tolerance"),
-        "transition_v_tolerance": ("options", "transition_v_tolerance"),
-        "precision_q_tolerance": ("options", "precision_q_tolerance"),
     },
     "geometry": {
         "cube_pos": ("options", "cube_pos"),

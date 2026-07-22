@@ -3,6 +3,7 @@ from enum import IntEnum
 from typing import Tuple
 
 import jax.numpy as jnp
+import mujoco
 import numpy as np
 
 from hydrax.task_base import Task
@@ -30,6 +31,18 @@ _GRIPPER_CLOSED_PHASES = (Phase.CLOSE, Phase.LIFT, Phase.TRANSPORT, Phase.PLACE)
 # boundary is time-only (the dwell duration is built into the timeline).
 _DWELL_PHASES = (Phase.CLOSE, Phase.OPEN)
 
+# Fixed task-success contract. These are deliberately code-level invariants,
+# not controller/OCP tuning parameters: a motion phase may finish only while
+# the measured end effector is at its goal and remains sufficiently still.
+# The action-pose bound applies before both gripper commands (CLOSE and OPEN).
+_ARRIVAL_EE_POSITION_TOLERANCE_M = 0.030
+_ARRIVAL_EE_ORIENTATION_TOLERANCE_RAD = 0.10
+_ACTION_EE_POSITION_TOLERANCE_M = 0.010
+_ACTION_EE_ORIENTATION_TOLERANCE_RAD = 0.075
+_EE_LINEAR_SPEED_TOLERANCE_M_S = 0.060
+_EE_ANGULAR_SPEED_TOLERANCE_RAD_S = 0.20
+_EE_STEADY_REQUIRED_SAMPLES = 5
+
 
 @dataclass(frozen=True, slots=True)
 class PickPlacePhaseDiagnostics:
@@ -54,13 +67,30 @@ class PickPlacePhaseDiagnostics:
     q_error_signed_by_joint_rad: tuple[float, ...]
     q_error_max_rad: float
     q_error_joint_index: int
-    q_tolerance_rad: float | None
-    q_ok: bool | None
     velocity_by_joint_rad_s: tuple[float, ...]
     velocity_abs_max_rad_s: float
     velocity_joint_index: int
-    velocity_tolerance_rad_s: float | None
-    velocity_ok: bool | None
+    ee_position_m: tuple[float, ...]
+    ee_goal_position_m: tuple[float, ...]
+    ee_position_error_signed_m: tuple[float, ...]
+    ee_position_error_norm_m: float
+    ee_position_tolerance_m: float | None
+    ee_position_ok: bool | None
+    ee_orientation_error_rad: float
+    ee_orientation_tolerance_rad: float | None
+    ee_orientation_ok: bool | None
+    ee_linear_velocity_m_s: tuple[float, ...]
+    ee_linear_speed_m_s: float
+    ee_linear_speed_tolerance_m_s: float | None
+    ee_linear_speed_ok: bool | None
+    ee_angular_velocity_rad_s: tuple[float, ...]
+    ee_angular_speed_rad_s: float
+    ee_angular_speed_tolerance_rad_s: float | None
+    ee_angular_speed_ok: bool | None
+    transition_blockers: tuple[str, ...]
+    consecutive_eligible_cycles: int | None
+    consecutive_required_cycles: int | None
+    consecutive_ok: bool | None
     precision_hold: bool
     gripper_command: str
 
@@ -131,20 +161,6 @@ class PandaPickPlaceOptions:
     # During OPEN's settle the gripper stays closed (settle at the place
     # pose while holding, then release).
     dwell_settle_sec: float = 0.5
-
-    # Segment-boundary transition gates: the plan clock crosses into the
-    # next phase only once the arm has converged on the segment goal.
-    # The q tolerance must sit above the exact_feedback hold wander
-    # (~0.02-0.03 rad spans) or the clock stalls forever.
-    transition_q_tolerance: float = 0.05
-    transition_v_tolerance: float = 0.15
-
-    # Tighter gate for the two boundaries entering a dwell (DESCEND->CLOSE,
-    # PLACE->OPEN): the gripper acts right after them, so these crossings
-    # ARE the grasp/place precision (P-A2 measured 13 mm lateral at the
-    # 0.05 rad gate; the reference holds the goal while the clock stalls,
-    # so the arm converges the rest of the way before the dwell starts)
-    precision_q_tolerance: float = 0.02
 
     # --- Deployment low level (not used by the task's costs/dynamics) ---
 
@@ -263,6 +279,25 @@ class PandaPickPlace(PandaPregrasp):
                 )
                 q_prev = self.phase_goal_q[phase]
 
+        # Cache the actually achievable FK pose of every IK goal once. Runtime
+        # gates compare the measured EE against these arrays, so the ROS
+        # adapter and direct MuJoCo example share exactly the same task-space
+        # contract without performing goal FK in the control loop.
+        pose_data = mujoco.MjData(mj_model)
+        site_id = mujoco.mj_name2id(
+            mj_model, mujoco.mjtObj.mjOBJ_SITE, "gripper"
+        )
+        self.phase_goal_ee_positions = np.zeros((len(phase_goal_pos), 3))
+        self.phase_goal_ee_rotations = np.zeros((len(phase_goal_pos), 3, 3))
+        for phase in list(phase_goal_pos):
+            pose_data.qpos[:] = self.phase_goal_q[phase]
+            pose_data.qvel[:] = 0.0
+            mujoco.mj_forward(mj_model, pose_data)
+            self.phase_goal_ee_positions[phase] = pose_data.site_xpos[site_id]
+            self.phase_goal_ee_rotations[phase] = pose_data.site_xmat[
+                site_id
+            ].reshape(3, 3)
+
         # One timeline: min-jerk segments between goals (duration from the
         # velocity cap, floored for gentle precision moves), constant
         # segments for the dwells. Segments share their boundary sample.
@@ -342,11 +377,11 @@ class PickPlacePhaseMachine:
     def __init__(self, task: PandaPickPlace) -> None:
         self._end_times = task.segment_end_times
         self._goals = task.phase_goal_q
-        self._q_tol = task.options.transition_q_tolerance
-        self._precision_q_tol = task.options.precision_q_tolerance
-        self._v_tol = task.options.transition_v_tolerance
+        self._goal_ee_positions = task.phase_goal_ee_positions
+        self._goal_ee_rotations = task.phase_goal_ee_rotations
         self._settle = float(task.options.dwell_settle_sec)
         self._dt = float(task.dt)
+        self._required_cycles = _EE_STEADY_REQUIRED_SAMPLES
         # kept a python float: an np.float64 leaking into state.time
         # changes the traced dtype and silently recompiles the solver
         self.plan_time = 0.0
@@ -355,6 +390,7 @@ class PickPlacePhaseMachine:
         # the tighter grasp/place gate. This drives diagnostics only; it
         # never requests a different gain law.
         self._stalled_at_dwell_entry = False
+        self._eligible_cycles = 0
 
     @property
     def phase(self) -> Phase:
@@ -385,15 +421,30 @@ class PickPlacePhaseMachine:
         return self.plan_time - start
 
     def diagnostics_snapshot(
-        self, q: np.ndarray, v: np.ndarray
+        self,
+        q: np.ndarray,
+        v: np.ndarray,
+        ee_position: np.ndarray,
+        ee_rotation: np.ndarray,
+        ee_linear_velocity: np.ndarray,
+        ee_angular_velocity: np.ndarray,
     ) -> PickPlacePhaseDiagnostics:
-        """Report the exact measured errors and tolerances used by the gate."""
+        """Report the gate inputs; joint-space values are diagnostic only."""
         phase = self.phase
         next_phase = None if phase == Phase.DONE else Phase(phase + 1).name
         goal_phase = min(phase, Phase.RETREAT)
-        q_err, q_joint, v_err, v_joint = self._state_errors(
-            q, v, goal_phase
+        q_err, q_joint, v_err, v_joint = self._state_errors(q, v, goal_phase)
+        ee_signed, ee_err, orientation_err = self._pose_errors(
+            ee_position, ee_rotation, goal_phase
         )
+        linear_velocity = np.asarray(
+            ee_linear_velocity, dtype=np.float64
+        ).reshape(3)
+        angular_velocity = np.asarray(
+            ee_angular_velocity, dtype=np.float64
+        ).reshape(3)
+        linear_speed = float(np.linalg.norm(linear_velocity))
+        angular_speed = float(np.linalg.norm(angular_velocity))
         q_error_signed_by_joint = tuple(
             float(value)
             for value in (
@@ -406,15 +457,23 @@ class PickPlacePhaseMachine:
             for value in np.asarray(v, dtype=np.float64).reshape(-1)
         )
 
+        blockers: tuple[str, ...] = ()
+        eligible_cycles: int | None = None
+        required_cycles: int | None = None
+        consecutive_ok: bool | None = None
+        ee_position_tol: float | None = None
+        ee_orientation_tol: float | None = None
+        ee_linear_speed_tol: float | None = None
+        ee_angular_speed_tol: float | None = None
+        ee_position_ok: bool | None = None
+        ee_orientation_ok: bool | None = None
+        ee_linear_speed_ok: bool | None = None
+        ee_angular_speed_ok: bool | None = None
         if phase == Phase.DONE:
             gate_type = "done"
             boundary = None
             time_to_boundary = None
             at_boundary = False
-            q_tol = None
-            v_tol = None
-            q_ok = None
-            v_ok = None
             status = "done"
         else:
             boundary = float(self._end_times[phase])
@@ -422,28 +481,41 @@ class PickPlacePhaseMachine:
             at_boundary = self.plan_time >= boundary
             if phase in _DWELL_PHASES:
                 gate_type = "time_only"
-                q_tol = None
-                v_tol = None
-                q_ok = None
-                v_ok = None
                 status = "time_only"
             else:
-                gate_type = "state"
-                q_tol = self._transition_q_tolerance(phase)
-                v_tol = self._v_tol
-                q_ok = q_err <= q_tol
-                v_ok = v_err <= v_tol
+                gate_type = "task_space"
+                ee_position_tol, ee_orientation_tol = (
+                    self._transition_pose_tolerances(phase)
+                )
+                ee_linear_speed_tol = _EE_LINEAR_SPEED_TOLERANCE_M_S
+                ee_angular_speed_tol = _EE_ANGULAR_SPEED_TOLERANCE_RAD_S
+                ee_position_ok = ee_err <= ee_position_tol
+                ee_orientation_ok = orientation_err <= ee_orientation_tol
+                ee_linear_speed_ok = linear_speed <= ee_linear_speed_tol
+                ee_angular_speed_ok = angular_speed <= ee_angular_speed_tol
+                eligible_cycles = int(self._eligible_cycles)
+                required_cycles = self._required_cycles
+                consecutive_ok = eligible_cycles >= required_cycles
+                blockers = self._transition_blockers(
+                    ee_position,
+                    ee_rotation,
+                    linear_velocity,
+                    angular_velocity,
+                    phase,
+                )
                 if not at_boundary:
                     status = "tracking"
-                elif not q_ok and not v_ok:
-                    status = "blocked_q_and_v"
-                elif not q_ok:
-                    status = "blocked_q"
-                elif not v_ok:
-                    status = "blocked_v"
+                    blockers = ()
+                elif blockers:
+                    status = "blocked_" + "_and_".join(blockers)
+                elif not consecutive_ok:
+                    status = "settling"
                 else:
                     status = "ready"
 
+        transition_blocked = bool(
+            at_boundary and status not in ("ready", "time_only")
+        )
         return PickPlacePhaseDiagnostics(
             phase=phase.name,
             next_phase=next_phase,
@@ -454,58 +526,161 @@ class PickPlacePhaseMachine:
             time_to_boundary_sec=time_to_boundary,
             at_boundary=bool(at_boundary),
             transition_status=status,
-            transition_blocked=status.startswith("blocked_"),
+            transition_blocked=transition_blocked,
             q_error_signed_by_joint_rad=q_error_signed_by_joint,
             q_error_max_rad=q_err,
             q_error_joint_index=q_joint,
-            q_tolerance_rad=q_tol,
-            q_ok=q_ok,
             velocity_by_joint_rad_s=velocity_by_joint,
             velocity_abs_max_rad_s=v_err,
             velocity_joint_index=v_joint,
-            velocity_tolerance_rad_s=v_tol,
-            velocity_ok=v_ok,
+            ee_position_m=tuple(
+                float(value)
+                for value in np.asarray(ee_position, dtype=np.float64).reshape(3)
+            ),
+            ee_goal_position_m=tuple(
+                float(value) for value in self._goal_ee_positions[goal_phase]
+            ),
+            ee_position_error_signed_m=tuple(float(value) for value in ee_signed),
+            ee_position_error_norm_m=ee_err,
+            ee_position_tolerance_m=ee_position_tol,
+            ee_position_ok=ee_position_ok,
+            ee_orientation_error_rad=orientation_err,
+            ee_orientation_tolerance_rad=ee_orientation_tol,
+            ee_orientation_ok=ee_orientation_ok,
+            ee_linear_velocity_m_s=tuple(
+                float(value) for value in linear_velocity
+            ),
+            ee_linear_speed_m_s=linear_speed,
+            ee_linear_speed_tolerance_m_s=ee_linear_speed_tol,
+            ee_linear_speed_ok=ee_linear_speed_ok,
+            ee_angular_velocity_rad_s=tuple(
+                float(value) for value in angular_velocity
+            ),
+            ee_angular_speed_rad_s=angular_speed,
+            ee_angular_speed_tolerance_rad_s=ee_angular_speed_tol,
+            ee_angular_speed_ok=ee_angular_speed_ok,
+            transition_blockers=blockers,
+            consecutive_eligible_cycles=eligible_cycles,
+            consecutive_required_cycles=required_cycles,
+            consecutive_ok=consecutive_ok,
             precision_hold=bool(self.precision_hold),
             gripper_command="close" if self.gripper_closed else "open",
         )
 
-    def update(self, q: np.ndarray, v: np.ndarray) -> float:
-        """Advance the plan clock by one control period; returns it."""
+    def update(
+        self,
+        q: np.ndarray,
+        v: np.ndarray,
+        ee_position: np.ndarray,
+        ee_rotation: np.ndarray,
+        ee_linear_velocity: np.ndarray,
+        ee_angular_velocity: np.ndarray,
+    ) -> float:
+        """Advance the clock from the EE pose/stillness contract."""
+        # Joint state is intentionally not part of phase acceptance. It is
+        # passed alongside the EE sample so callers use one coherent measured
+        # state for update and diagnostics, and is logged by the latter.
+        del q, v
         phase = self.phase
         if phase == Phase.DONE:
             self.plan_time += self._dt
+            self._eligible_cycles = 0
             return self.plan_time
+
         boundary = self._end_times[phase]
         t_next = self.plan_time + self._dt
         if t_next < boundary:
             self.plan_time = t_next
+            self._eligible_cycles = 0
             self._stalled_at_dwell_entry = False
-        elif phase in _DWELL_PHASES or self._converged(q, v, phase):
-            self.plan_time = t_next  # cross into the next phase
+        elif phase in _DWELL_PHASES:
+            self.plan_time = t_next
+            self._eligible_cycles = 0
             self._stalled_at_dwell_entry = False
         else:
-            self.plan_time = float(boundary)  # hold the segment goal
-            # Mark only the final precision wait near a dwell entry, not a
-            # far-away arrival stall. The bridge logs this distinction but
-            # keeps the configured gain law unchanged.
-            q_err = np.abs(np.asarray(q) - self._goals[phase]).max()
-            self._stalled_at_dwell_entry = (
-                Phase(phase + 1) in _DWELL_PHASES and q_err <= self._q_tol
+            blockers = self._transition_blockers(
+                ee_position,
+                ee_rotation,
+                ee_linear_velocity,
+                ee_angular_velocity,
+                phase,
             )
+            self._eligible_cycles = 0 if blockers else self._eligible_cycles + 1
+            if self._eligible_cycles >= self._required_cycles:
+                self.plan_time = t_next
+                self._eligible_cycles = 0
+                self._stalled_at_dwell_entry = False
+            else:
+                self.plan_time = float(boundary)
+                _, ee_err, orientation_err = self._pose_errors(
+                    ee_position, ee_rotation, phase
+                )
+                self._stalled_at_dwell_entry = bool(
+                    Phase(phase + 1) in _DWELL_PHASES
+                    and ee_err <= _ARRIVAL_EE_POSITION_TOLERANCE_M
+                    and orientation_err
+                    <= _ARRIVAL_EE_ORIENTATION_TOLERANCE_RAD
+                )
         return self.plan_time
 
-    def _converged(self, q: np.ndarray, v: np.ndarray, phase: Phase) -> bool:
-        q_tol = self._transition_q_tolerance(phase)
-        q_err, _, v_err, _ = self._state_errors(q, v, phase)
-        return q_err <= q_tol and v_err <= self._v_tol
-
-    def _transition_q_tolerance(self, phase: Phase) -> float:
-        """Return the joint-position tolerance at a motion boundary."""
-        return (
-            self._precision_q_tol
-            if Phase(phase + 1) in _DWELL_PHASES
-            else self._q_tol
+    def _transition_blockers(
+        self,
+        ee_position: np.ndarray,
+        ee_rotation: np.ndarray,
+        ee_linear_velocity: np.ndarray,
+        ee_angular_velocity: np.ndarray,
+        phase: Phase,
+    ) -> tuple[str, ...]:
+        _, ee_err, orientation_err = self._pose_errors(
+            ee_position, ee_rotation, phase
         )
+        linear_speed = float(np.linalg.norm(ee_linear_velocity))
+        angular_speed = float(np.linalg.norm(ee_angular_velocity))
+        ee_position_tol, ee_orientation_tol = self._transition_pose_tolerances(
+            phase
+        )
+        blockers = []
+        if not np.isfinite(ee_err) or ee_err > ee_position_tol:
+            blockers.append("ee_position")
+        if not np.isfinite(orientation_err) or orientation_err > ee_orientation_tol:
+            blockers.append("ee_orientation")
+        if (
+            not np.isfinite(linear_speed)
+            or linear_speed > _EE_LINEAR_SPEED_TOLERANCE_M_S
+        ):
+            blockers.append("ee_linear_speed")
+        if (
+            not np.isfinite(angular_speed)
+            or angular_speed > _EE_ANGULAR_SPEED_TOLERANCE_RAD_S
+        ):
+            blockers.append("ee_angular_speed")
+        return tuple(blockers)
+
+    def _transition_pose_tolerances(self, phase: Phase) -> tuple[float, float]:
+        """Return position/orientation tolerances for a motion boundary."""
+        next_phase = Phase(phase + 1)
+        if next_phase in _DWELL_PHASES:
+            return (
+                _ACTION_EE_POSITION_TOLERANCE_M,
+                _ACTION_EE_ORIENTATION_TOLERANCE_RAD,
+            )
+        return (
+            _ARRIVAL_EE_POSITION_TOLERANCE_M,
+            _ARRIVAL_EE_ORIENTATION_TOLERANCE_RAD,
+        )
+
+    def _pose_errors(
+        self,
+        ee_position: np.ndarray,
+        ee_rotation: np.ndarray,
+        goal_phase: Phase,
+    ) -> tuple[np.ndarray, float, float]:
+        position = np.asarray(ee_position, dtype=np.float64).reshape(3)
+        rotation = np.asarray(ee_rotation, dtype=np.float64).reshape(3, 3)
+        signed = position - self._goal_ee_positions[goal_phase]
+        relative = self._goal_ee_rotations[goal_phase].T @ rotation
+        cosine = np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0)
+        return signed, float(np.linalg.norm(signed)), float(np.arccos(cosine))
 
     def _state_errors(
         self, q: np.ndarray, v: np.ndarray, goal_phase: Phase
