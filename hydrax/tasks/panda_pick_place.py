@@ -142,6 +142,15 @@ class PandaPickPlaceOptions:
     tau_max: Tuple[float, ...] = (87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0)
     vel_max: Tuple[float, ...] = (2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61)
 
+    # --- Planning model constraint solver ---
+
+    # Newton budget for the derived planning model, set by the `model:`
+    # section of the tuning yaml. See PandaPregraspOptions for the
+    # measurements behind these values — this task shares the same
+    # derivation, so it must expose the same knobs.
+    mujoco_solver_iterations: int = 5
+    mujoco_solver_ls_iterations: int = 8
+
     # --- Reference timeline ---
 
     # Cap on each segment's peak joint velocity, as a fraction of the limits
@@ -242,7 +251,11 @@ class PandaPickPlace(PandaPregrasp):
             options = PandaPickPlaceOptions()
         self.options = options
 
-        mj_model = self._derive_arm_planning_model(options.start_q)
+        mj_model = self._derive_arm_planning_model(
+            options.start_q,
+            solver_iterations=options.mujoco_solver_iterations,
+            solver_ls_iterations=options.mujoco_solver_ls_iterations,
+        )
         # PandaPregrasp.__init__ builds the single pregrasp reach; this
         # task builds its own timeline, so it initializes the Task base
         # directly and reuses the parent's machinery (IK, quintic,

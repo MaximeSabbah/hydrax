@@ -16,6 +16,12 @@ from hydrax.tasks.panda_pregrasp import PandaPregrasp, PandaPregraspOptions
 
 HOME_Q = PandaPregraspOptions.start_q
 
+#: Identified joint dissipation, 2026-07-30 FR3 campaign (fer_mujoco_sysid,
+#: released consumer model fer_identified.xml). These are the values
+#: models/panda/panda.xml carries and fer_ros2_control.xml mirrors.
+IDENTIFIED_FRICTIONLOSS = (0.8509, 0.8517, 0.8928, 0.8808, 0.6042, 0.7785, 0.3249)
+IDENTIFIED_DAMPING = (1.0, 1.0, 1.0991, 0.944, 1.0, 1.0, 1.0)
+
 
 @pytest.fixture(scope="module")
 def planning():
@@ -35,9 +41,15 @@ def test_planning_model_is_the_contact_free_arm(planning) -> None:
     # torque motors at the Franka limits
     expected = [87.0] * 4 + [12.0] * 3
     assert np.allclose(planning.actuator_ctrlrange[:, 1], expected)
-    # Menagerie-standard joint dynamics
+    # Armature stays the Menagerie rotor-inertia surrogate.
     assert np.allclose(planning.dof_armature, 0.1)
-    assert np.allclose(planning.dof_damping, 1.0)
+    # Joint dissipation is identified from the 2026-07-30 FR3 campaign
+    # (fer_mujoco_sysid). Damping is the fit only where the cruise data
+    # resolved a viscous slope — joints 3 and 4 — and the nominal 1.0
+    # elsewhere; frictionloss is the Coulomb term on every joint. Pinned so
+    # the planning model cannot silently revert to the frictionless default.
+    assert np.allclose(planning.dof_damping, IDENTIFIED_DAMPING)
+    assert np.allclose(planning.dof_frictionloss, IDENTIFIED_FRICTIONLOSS)
     assert np.allclose(planning.key("home").qpos, HOME_Q)
 
 

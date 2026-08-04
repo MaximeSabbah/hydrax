@@ -26,8 +26,23 @@ solver:
   num_knots: 4
   spline_type: linear # knot interpolation: zero, linear or cubic (gains need knot-linearity); linear measured calmer at the hold than cubic
   plan_horizon: 0.32 # seconds (8 steps; H is the sequential depth of both the sampling and the gain path)
-  iterations: 3
-  num_gain_samples: 128 # gain batch: zero-noise nominal + lowest-cost samples
+  iterations: 1
+  num_gain_samples: 256 # gain batch: zero-noise nominal + lowest-cost samples
+
+# MuJoCo's Newton budget for the derived planning model. Contacts are
+# disabled there, so before the identified joint friction the model carried
+# no constraints and these were free at MuJoCo's 100/50 default. Friction
+# adds one constraint per joint and MJX runs every iteration it is given, on
+# every sample of every rollout step: 100/50 measured ~125 ms per control
+# step against the 40 ms budget, 5/8 measured ~29 ms.
+#
+# 5/8 converges the seven friction constraints to machine precision
+# (2.8e-17 rad over one 8-step horizon). Lowering further is a false
+# economy — the line search binds first, so 3/5 costs 7.1e-3 rad and 2/4
+# costs 2.9e-2 rad for only a few ms.
+model:
+  solver_iterations: 5
+  solver_ls_iterations: 8
 
 plan:
   duration_sec: 7.5

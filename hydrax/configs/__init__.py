@@ -43,6 +43,10 @@ _PREGRASP_YAML_SCHEMA = {
         "iterations": ("config", "iterations"),
         "num_gain_samples": ("config", "num_gain_samples"),
     },
+    "model": {
+        "solver_iterations": ("options", "mujoco_solver_iterations"),
+        "solver_ls_iterations": ("options", "mujoco_solver_ls_iterations"),
+    },
     "plan": {
         "duration_sec": ("options", "duration_sec"),
         "max_velocity_fraction": ("options", "max_velocity_fraction"),
@@ -69,6 +73,10 @@ _PICK_PLACE_YAML_SCHEMA = {
         "plan_horizon": ("config", "plan_horizon"),
         "iterations": ("config", "iterations"),
         "num_gain_samples": ("config", "num_gain_samples"),
+    },
+    "model": {
+        "solver_iterations": ("options", "mujoco_solver_iterations"),
+        "solver_ls_iterations": ("options", "mujoco_solver_ls_iterations"),
     },
     "plan": {
         "max_velocity_fraction": ("options", "max_velocity_fraction"),

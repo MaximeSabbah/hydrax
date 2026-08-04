@@ -49,6 +49,27 @@ class PandaPregraspOptions:
     tau_max: Tuple[float, ...] = (87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0)
     vel_max: Tuple[float, ...] = (2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61)
 
+    # --- Planning model constraint solver ---
+
+    # MuJoCo's Newton solver budget for the derived planning model, set by
+    # the `model:` section of the tuning yaml.
+    #
+    # These were MuJoCo's defaults (100/50) while the planning model carried
+    # no constraints at all — contacts are disabled, so the solver had
+    # nothing to converge and the budget was never paid. Joint frictionloss
+    # adds one constraint per joint, and MJX cannot early-exit a solver loop
+    # the way C MuJoCo does: it runs every iteration it is given, for every
+    # sample of every rollout step. At 100/50 that measured ~125 ms per
+    # control step against a 40 ms budget.
+    #
+    # 5/8 (what the ROS plant scene already uses) converges seven friction
+    # constraints to machine precision — 2.8e-17 rad over one 8-step
+    # horizon against a fully-converged reference. Below that accuracy
+    # falls off a cliff: 3/5 gives 7.1e-3 rad and 2/4 gives 2.9e-2, because
+    # the line search, not the Newton count, is what binds.
+    mujoco_solver_iterations: int = 5
+    mujoco_solver_ls_iterations: int = 8
+
     # --- Reference plan ---
 
     # Nominal reach duration (s); stretched if the peak plan velocity would
@@ -158,7 +179,11 @@ class PandaPregrasp(Task):
             options = PandaPregraspOptions()
         self.options = options
 
-        mj_model = self._derive_arm_planning_model(options.start_q)
+        mj_model = self._derive_arm_planning_model(
+            options.start_q,
+            solver_iterations=options.mujoco_solver_iterations,
+            solver_ls_iterations=options.mujoco_solver_ls_iterations,
+        )
         super().__init__(mj_model, trace_sites=["gripper"], impl=impl)
 
         # Reference plan: IK goal, then a quintic joint plan sampled at the
@@ -206,7 +231,12 @@ class PandaPregrasp(Task):
         )
 
     @staticmethod
-    def _derive_arm_planning_model(home_q) -> mujoco.MjModel:
+    def _derive_arm_planning_model(
+        home_q,
+        *,
+        solver_iterations: int = PandaPregraspOptions.mujoco_solver_iterations,
+        solver_ls_iterations: int = PandaPregraspOptions.mujoco_solver_ls_iterations,
+    ) -> mujoco.MjModel:
         """The 7-DoF PLANNING variant of models/panda/panda.xml.
 
         There is one robot description (panda.xml: arm + articulated
@@ -235,6 +265,10 @@ class PandaPregrasp(Task):
         spec.option.timestep = 0.04
         spec.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
         spec.option.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
+        # See PandaPregraspOptions.mujoco_solver_iterations for why this is
+        # not MuJoCo's 100/50 default and what it costs to lower it further.
+        spec.option.iterations = solver_iterations
+        spec.option.ls_iterations = solver_ls_iterations
         spec.add_key(name="home", qpos=list(home_q))
         return spec.compile()
 
