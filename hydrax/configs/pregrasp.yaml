@@ -35,7 +35,7 @@ solver:
   mean_adaptation_rate: 1.0 # <1 damps the hold jitter (partial mean update)
   num_knots: 4
   spline_type: linear # knot interpolation: zero, linear or cubic (gains need knot-linearity); linear measured calmer at the hold than cubic
-  plan_horizon: 0.32 # seconds (8 steps; H is the sequential depth of both the sampling and the gain path)
+  num_steps: 8 # prediction horizon in control steps; seconds = num_steps * model.dt
   iterations: 1
   num_gain_samples: 256 # gain batch: zero-noise nominal + lowest-cost samples
 
@@ -53,6 +53,12 @@ solver:
 model:
   solver_iterations: 5
   solver_ls_iterations: 8
+  # false zeroes the planning model's friction at load (file untouched).
+  # The only constraint source here: 30.1 -> 10.7 ms/solve, but 3.14 -> 21.66 mm.
+  with_frictionloss: true
+  # Control period and the model's physics timestep (one step per control
+  # step). The bridge's publish_rate_hz must be 1 / dt.
+  dt: 0.04
 
 plan:
   duration_sec: 7.5

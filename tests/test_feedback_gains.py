@@ -181,7 +181,7 @@ def _pregrasp_controller(task, config, num_gain_samples, iterations) -> Feedback
         mean_adaptation_rate=config.mean_adaptation_rate,
         num_gain_samples=num_gain_samples,
         compute_gains=True,
-        plan_horizon=config.plan_horizon,
+        plan_horizon=config.num_steps * task.dt,
         spline_type=config.spline_type,
         num_knots=config.num_knots,
         iterations=iterations,

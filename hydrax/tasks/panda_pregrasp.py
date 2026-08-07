@@ -107,6 +107,19 @@ class PandaPregraspOptions:
     mujoco_solver_iterations: int = 5
     mujoco_solver_ls_iterations: int = 8
 
+    # Control period (s), and the planning model's physics timestep: rollouts
+    # take one physics step per control step. The solver's num_steps then sets
+    # the prediction horizon, control_period * num_steps. The bridge's
+    # publish_rate_hz must equal 1 / control_period or the plan clock drifts.
+    control_period: float = 0.04
+
+    # Keep the identified joint frictionloss in the PLANNING model. The model
+    # file is never edited; False zeroes it at derivation. Contacts are
+    # disabled, so this is the only constraint source: dropping it measured
+    # 30.1 -> 10.7 ms per solve, but 3.14 -> 21.66 mm terminal error and an
+    # arm still moving at 0.11 rad/s (2026-08-07, 3 seeds).
+    with_frictionloss: bool = True
+
     # --- Reference plan ---
 
     # Nominal reach duration (s); stretched if the peak plan velocity would
@@ -168,7 +181,10 @@ class PregraspControllerConfig:
     # convergence per iteration.
     mean_adaptation_rate: float = 1.0
 
-    plan_horizon: float = 0.4
+    # Prediction horizon in control steps. The horizon in seconds is
+    # num_steps * PandaPregraspOptions.control_period; the pairing glue
+    # passes that product to the controller as plan_horizon.
+    num_steps: int = 8
     spline_type: str = "cubic"
     num_knots: int = 4
     iterations: int = 1
@@ -220,6 +236,8 @@ class PandaPregrasp(Task):
             options.start_q,
             solver_iterations=options.mujoco_solver_iterations,
             solver_ls_iterations=options.mujoco_solver_ls_iterations,
+            with_frictionloss=options.with_frictionloss,
+            control_period=options.control_period,
         )
         super().__init__(mj_model, trace_sites=["gripper"], impl=impl)
 
@@ -276,6 +294,8 @@ class PandaPregrasp(Task):
         *,
         solver_iterations: int = PandaPregraspOptions.mujoco_solver_iterations,
         solver_ls_iterations: int = PandaPregraspOptions.mujoco_solver_ls_iterations,
+        with_frictionloss: bool = PandaPregraspOptions.with_frictionloss,
+        control_period: float = PandaPregraspOptions.control_period,
     ) -> mujoco.MjModel:
         """The 7-DoF PLANNING variant of models/panda/panda.xml.
 
@@ -302,7 +322,7 @@ class PandaPregrasp(Task):
                 spec.delete(actuator)
         for equality in list(spec.equalities):
             spec.delete(equality)
-        spec.option.timestep = 0.04
+        spec.option.timestep = control_period
         spec.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
         spec.option.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
         # See PandaPregraspOptions.mujoco_solver_iterations for why this is
@@ -310,7 +330,10 @@ class PandaPregrasp(Task):
         spec.option.iterations = solver_iterations
         spec.option.ls_iterations = solver_ls_iterations
         spec.add_key(name="home", qpos=list(home_q))
-        return spec.compile()
+        model = spec.compile()
+        if not with_frictionloss:
+            model.dof_frictionloss[:] = 0.0
+        return model
 
     def _solve_ik(
         self,

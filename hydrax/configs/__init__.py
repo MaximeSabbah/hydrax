@@ -40,13 +40,15 @@ _PREGRASP_YAML_SCHEMA = {
         "mean_adaptation_rate": ("config", "mean_adaptation_rate"),
         "num_knots": ("config", "num_knots"),
         "spline_type": ("config", "spline_type"),
-        "plan_horizon": ("config", "plan_horizon"),
+        "num_steps": ("config", "num_steps"),
         "iterations": ("config", "iterations"),
         "num_gain_samples": ("config", "num_gain_samples"),
     },
     "model": {
         "solver_iterations": ("options", "mujoco_solver_iterations"),
         "solver_ls_iterations": ("options", "mujoco_solver_ls_iterations"),
+        "with_frictionloss": ("options", "with_frictionloss"),
+        "dt": ("options", "control_period"),
     },
     "plan": {
         "duration_sec": ("options", "duration_sec"),

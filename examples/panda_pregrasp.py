@@ -235,7 +235,7 @@ ctrl = FeedbackMPPI(
     mean_adaptation_rate=config.mean_adaptation_rate,
     num_gain_samples=config.num_gain_samples,
     compute_gains=(args.mode == "feedback"),
-    plan_horizon=config.plan_horizon,
+    plan_horizon=config.num_steps * task.dt,
     spline_type=config.spline_type,
     num_knots=config.num_knots,
     iterations=config.iterations,
