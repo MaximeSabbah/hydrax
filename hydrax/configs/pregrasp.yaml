@@ -14,9 +14,19 @@
 # rerun the gates before trusting a changed value.
 
 costs:
-  configuration_weight: 1.0
+  # Activation applied to each squared residual (crocoddyl's ActivationModel):
+  #   quadratic -> 0.5|r|^2, constant Hessian (ActivationModelWeightedQuad)
+  #   saturated -> 1 - exp(-|r|^2), bounded to [0,1) but its curvature decays
+  #                to zero, which blinds the OCP to the control
+  # Weights below are ABSOLUTE (not normalized against each other) and are
+  # tuned for `quadratic`; selecting `saturated` needs them and `temperature`
+  # retuned together.
+  activation: quadratic
+  # Proportions from crocoddyl's canonical reaching OCPs: tracking 10,
+  # state regularization 1e-1, control regularization 1e-4.
+  configuration_weight: 10.0
   velocity_weight: 0.1
-  control_weight: 0.01
+  control_weight: 0.0001
 
 solver:
   num_samples: 1024

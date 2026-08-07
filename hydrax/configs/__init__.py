@@ -28,6 +28,7 @@ PICK_PLACE_CONFIG_YAML = ROOT + "/configs/pick_place.yaml"
 # keys in the yaml are an error.
 _PREGRASP_YAML_SCHEMA = {
     "costs": {
+        "activation": ("options", "cost_activation"),
         "configuration_weight": ("options", "configuration_cost_weight"),
         "velocity_weight": ("options", "velocity_cost_weight"),
         "control_weight": ("options", "control_cost_weight"),

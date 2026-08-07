@@ -39,11 +39,19 @@ class FeedbackMPPIParams(SamplingParams):
                              this is its direct fingerprint (V-A3 bounds
                              how often it exceeds 0.5). Zero until gains
                              are computed.
+        planned_next_state: [q; v] one control period after x₀ under the
+                            updated plan's first control, shape (nq + nv,).
+                            The state this solve intends the robot to reach
+                            next — what the 1 kHz low level servos toward in
+                            feedback mode. See optimize() for why it is
+                            recomputed rather than read off the scored
+                            rollouts. Zero before the first solve.
     """
 
     gains: jax.Array
     gain_ess: jax.Array
     gain_nominal_weight: jax.Array
+    planned_next_state: jax.Array
 
 
 class FeedbackMPPI(SamplingBasedController):
@@ -197,6 +205,7 @@ class FeedbackMPPI(SamplingBasedController):
             gains=jnp.zeros((self.task.model.nu, nx)),
             gain_ess=jnp.zeros(()),
             gain_nominal_weight=jnp.zeros(()),
+            planned_next_state=jnp.zeros(nx),
         )
 
     def sample_knots(
@@ -243,7 +252,22 @@ class FeedbackMPPI(SamplingBasedController):
                 gain_ess=ess,
                 gain_nominal_weight=nominal_weight,
             )
-        return params, rollouts
+
+        # The state this solve intends to reach next: one control period from
+        # x₀ under the UPDATED plan's first control, in the planner's own
+        # model. Deliberately recomputed rather than read off `rollouts`:
+        # those were scored with the PRE-update mean — they are the input to
+        # the softmax update, not its output — so their second state belongs
+        # to the previous plan, whereas u* below is what actually gets
+        # published. One extra step against the num_samples x H already
+        # rolled out, so the cost is negligible.
+        u_star = self.get_action(params, state.time)
+        planned_next = mjx.step(self.model, state.replace(ctrl=u_star))
+        return params.replace(
+            planned_next_state=jnp.concatenate(
+                [planned_next.qpos, planned_next.qvel]
+            )
+        ), rollouts
 
     def _compute_gains(
         self, state: mjx.Data, rollouts: Trajectory
