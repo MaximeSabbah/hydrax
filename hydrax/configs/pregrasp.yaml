@@ -30,12 +30,12 @@ costs:
 
 solver:
   num_samples: 1024
-  noise_scale: 0.03 # sampling std = noise_scale * tau_max, per joint
-  temperature: 0.007
+  noise_scale: 0.03 # 0.03 for frictionloss to true, sampling std = noise_scale * tau_max, per joint
+  temperature: 0.007 # 0.007 for frictionloss to true
   mean_adaptation_rate: 1.0 # <1 damps the hold jitter (partial mean update)
   num_knots: 4
   spline_type: linear # knot interpolation: zero, linear or cubic (gains need knot-linearity); linear measured calmer at the hold than cubic
-  num_steps: 8 # prediction horizon in control steps; seconds = num_steps * model.dt
+  num_steps: 8 # 8 with frictionloss to true, prediction horizon in control steps; seconds = num_steps * model.dt
   iterations: 1
   num_gain_samples: 256 # gain batch: zero-noise nominal + lowest-cost samples
 
@@ -58,7 +58,7 @@ model:
   with_frictionloss: true
   # Control period and the model's physics timestep (one step per control
   # step). The bridge's publish_rate_hz must be 1 / dt.
-  dt: 0.04
+  dt: 0.04 # 0.04 with frictionloss to true, if you change this check as well hydrax_bridge.yaml in ros
 
 plan:
   duration_sec: 7.5

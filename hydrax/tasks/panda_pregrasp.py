@@ -21,6 +21,14 @@ _ACTIVATIONS = {
     "saturated": lambda squared_error: 1.0 - jnp.exp(-squared_error),
 }
 
+# Friction feedforward, live only when with_frictionloss is False. The plant
+# (sim and FR3) keeps its identified joint friction, so a frictionless planning
+# model under-commands by that torque: the arm stalls mid-reach and then creeps
+# for minutes. tau += f_c*tanh(v/eps) adds torque in the DIRECTION OF MOTION,
+# which is what cancels it -- the opposite sign doubles friction instead.
+FRICTION_FF_FRACTION = 0.8
+FRICTION_FF_V_EPS = 0.04
+
 
 @dataclass
 class PandaPregraspOptions:
@@ -233,13 +241,23 @@ class PandaPregrasp(Task):
             options = PandaPregraspOptions()
         self.options = options
 
+        # Built WITH friction whatever the option, then zeroed here: zeroing in
+        # the deriver would destroy the identified values, and the friction
+        # feedforward below needs them.
         mj_model = self._derive_arm_planning_model(
             options.start_q,
             solver_iterations=options.mujoco_solver_iterations,
             solver_ls_iterations=options.mujoco_solver_ls_iterations,
-            with_frictionloss=options.with_frictionloss,
+            with_frictionloss=True,
             control_period=options.control_period,
         )
+        if options.with_frictionloss:
+            self.friction_ff_tau = np.zeros(mj_model.nu, dtype=np.float64)
+        else:
+            self.friction_ff_tau = np.asarray(
+                mj_model.dof_frictionloss[: mj_model.nu], dtype=np.float64
+            ).copy()
+            mj_model.dof_frictionloss[:] = 0.0
         super().__init__(mj_model, trace_sites=["gripper"], impl=impl)
 
         # Reference plan: IK goal, then a quintic joint plan sampled at the
