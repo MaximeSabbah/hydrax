@@ -209,7 +209,10 @@ class SamplingBasedController(ABC):
             states = states.tree_replace(randomizations)
 
         # compute the control sequence from the knots
-        tq = jnp.linspace(tk[0], tk[-1], self.ctrl_steps)
+        # One query per physics step: the rollout advances by dt per step, so
+        # the controls must sit on that grid. linspace over [tk[0], tk[-1]] is
+        # 14% wider at 8 steps, putting the last control a full dt late.
+        tq = tk[0] + jnp.arange(self.ctrl_steps) * self.dt
         controls = self.interp_func(tq, tk, knots)  # (num_rollouts, H, nu)
 
         # Apply the control sequences, parallelized over both rollouts and

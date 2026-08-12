@@ -195,6 +195,7 @@ class PregraspControllerConfig:
     num_gain_samples: int = 128
 
 
+
 class PandaPregrasp(Task):
     """The Panda tracks a minimum-jerk joint plan to a pregrasp pose.
 
@@ -330,6 +331,13 @@ class PandaPregrasp(Task):
         spec.option.iterations = solver_iterations
         spec.option.ls_iterations = solver_ls_iterations
         spec.add_key(name="home", qpos=list(home_q))
+        # Plan parameters carried on mjx.Data.userdata: [q0 (nq), duration].
+        # userdata is a traced field that mjx.step passes through untouched,
+        # so the reference plan reaches running_cost as an ARGUMENT rather
+        # than a trace-time constant. That is what makes the compiled rollout
+        # plan-agnostic: any start configuration reuses the same executable
+        # (and the same compilation-cache entry) instead of recompiling.
+        spec.nuserdata = len(home_q) + 1
         model = spec.compile()
         if not with_frictionloss:
             model.dof_frictionloss[:] = 0.0
@@ -400,38 +408,61 @@ class PandaPregrasp(Task):
             tau[k] = data.qfrc_inverse
         return np.clip(tau, -tau_max, tau_max)
 
-    def _get_reference_configuration(self, t: jax.Array) -> jax.Array:
-        """Get the reference position (q) at time t."""
-        i = jnp.int32(t * self.reference_fps)
-        i = jnp.clip(i, 0, self.reference_qpos.shape[0] - 1)
-        return self.reference_qpos[i, :]
 
-    def _get_reference_velocity(self, t: jax.Array) -> jax.Array:
-        """Get the reference velocity (v) at time t."""
-        i = jnp.int32(t * self.reference_fps)
-        i = jnp.clip(i, 0, self.reference_qvel.shape[0] - 1)
-        return self.reference_qvel[i, :]
+    @staticmethod
+    def plan_userdata(q0: np.ndarray, duration: float) -> np.ndarray:
+        """Pack the plan parameters for mjx.Data.userdata: [q0, duration]."""
+        q0 = np.asarray(q0, dtype=np.float64).reshape(-1)
+        return np.concatenate([q0, [float(duration)]])
 
-    def _get_reference_control(self, t: jax.Array) -> jax.Array:
-        """Get the feedforward torque at time t."""
-        i = jnp.int32(t * self.reference_fps)
-        i = jnp.clip(i, 0, self.reference_ctrl.shape[0] - 1)
-        return self.reference_ctrl[i, :]
+    def _plan_params(self, state: mjx.Data) -> Tuple[jax.Array, jax.Array]:
+        """(q0, duration) of the reference plan, read off the state.
+
+        Falls back to the construction-time plan when userdata is unset (all
+        zero duration), so the task still works outside the ROS adapter.
+        """
+        nq = self.model.nq
+        q0, duration = state.userdata[:nq], state.userdata[nq]
+        unset = duration <= 0.0
+        return (
+            jnp.where(unset, jnp.asarray(self.start_q, dtype=q0.dtype), q0),
+            jnp.where(unset, self.duration, duration),
+        )
+
+    def _reference(self, state: mjx.Data) -> Tuple[jax.Array, jax.Array]:
+        """Minimum-jerk reference (q, v) at state.time, evaluated in closed form.
+
+        The quintic is analytic in its start configuration, so the plan is
+        fully described by (q0, duration) — 8 floats on userdata — instead of
+        a sampled table baked into the compiled graph. Past the plan end it
+        holds the goal at zero velocity, matching the previous table lookup's
+        index clamp.
+        """
+        q0, duration = self._plan_params(state)
+        dq = self.goal_q - q0
+        tau = jnp.clip(state.time / duration, 0.0, 1.0)
+        s = 10 * tau**3 - 15 * tau**4 + 6 * tau**5
+        ds = (30 * tau**2 - 60 * tau**3 + 30 * tau**4) / duration
+        return q0 + s * dq, ds * dq
 
     def running_cost(self, state: mjx.Data, control: jax.Array) -> jax.Array:
         """The running cost ℓ(xₜ, uₜ)."""
-        # Joint angle tracking error
-        q_ref = self._get_reference_configuration(state.time)
+        # Tracking errors against the plan carried on userdata
+        q_ref, v_ref = self._reference(state)
         q_err = state.qpos - q_ref  # size (nq,)
-
-        # Joint velocity tracking error
-        v_ref = self._get_reference_velocity(state.time)
         v_err = state.qvel - v_ref  # size (nv,)
 
-        # Control error around the feedforward plan, per-joint normalized so
-        # the strong shoulder joints (87 Nm) and the wrist (12 Nm) compare
-        u_ref = self._get_reference_control(state.time)
-        u_err = (control - u_ref) / self.tau_max  # size (nu,)
+        # Control regularization about gravity compensation, per-joint
+        # normalized so the strong shoulder joints (87 Nm) and the wrist
+        # (12 Nm) compare. This is crocoddyl's ResidualModelControlGrav
+        # (u - g(q)) up to one difference: qfrc_bias is MuJoCo's full bias
+        # force C(q,v)v + g(q), so it also carries Coriolis, where crocoddyl
+        # uses computeGeneralizedGravity(q) alone. Isolating gravity would
+        # need a second forward pass with qvel zeroed on every rollout step
+        # of every sample; measured along this plan the two differ by at
+        # most 0.048% of tau_max (peak plan speed is capped at 20% of the
+        # velocity limits), contributing ~2e-11 to the cost at this weight.
+        u_err = (control - state.qfrc_bias) / self.tau_max  # size (nu,)
 
         # Weighted sum of the activated squared residuals — crocoddyl's
         # CostModelSum over three CostModelResidual terms.
@@ -477,8 +508,9 @@ class PandaPregrasp(Task):
         # The control term is dropped, as crocoddyl's terminal CostModelSum
         # drops its control regularization: there is no control at the
         # terminal node to regularize.
-        q_err = state.qpos - self._get_reference_configuration(state.time)
-        v_err = state.qvel - self._get_reference_velocity(state.time)
+        q_ref, v_ref = self._reference(state)
+        q_err = state.qpos - q_ref
+        v_err = state.qvel - v_ref
         activation = _ACTIVATIONS[self.cost_activation]
         return (
             self.configuration_cost_weight * activation(jnp.sum(jnp.square(q_err)))

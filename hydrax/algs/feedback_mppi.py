@@ -13,6 +13,15 @@ from hydrax.alg_base import (
 from hydrax.risk import RiskStrategy
 from hydrax.task_base import Task
 
+# Clip each rollout's dJ/dx0 to this multiple of the gain batch's median norm,
+# preserving direction. K's only unbounded factor is dJ/dx0 -- a product of the
+# per-step Jacobians, so it grows multiplicatively and its distribution has an
+# infinite-variance tail (index ~2 over 13k solves). Measured at the |K| spikes
+# it is 103x the batch median while the weights, cost spread and warm start do
+# not move. The old saturated cost damped this through its exp(-|e|^2) factor;
+# the quadratic cost does not.
+GRADIENT_CLIP_FACTOR = 10.0
+
 
 @dataclass
 class FeedbackMPPIParams(SamplingParams):
@@ -52,6 +61,8 @@ class FeedbackMPPIParams(SamplingParams):
     gain_ess: jax.Array
     gain_nominal_weight: jax.Array
     planned_next_state: jax.Array
+    gain_grad_max: jax.Array
+    cost_spread: jax.Array
 
 
 class FeedbackMPPI(SamplingBasedController):
@@ -206,6 +217,8 @@ class FeedbackMPPI(SamplingBasedController):
             gain_ess=jnp.zeros(()),
             gain_nominal_weight=jnp.zeros(()),
             planned_next_state=jnp.zeros(nx),
+            gain_grad_max=jnp.zeros(()),
+            cost_spread=jnp.zeros(()),
         )
 
     def sample_knots(
@@ -246,11 +259,15 @@ class FeedbackMPPI(SamplingBasedController):
         """Optimize as usual, then compute the gains from the same rollouts."""
         params, rollouts = super().optimize(state, params)
         if self.compute_gains:
-            gains, ess, nominal_weight = self._compute_gains(state, rollouts)
+            gains, ess, nominal_weight, grad_max, spread = self._compute_gains(
+                state, rollouts
+            )
             params = params.replace(
                 gains=gains,
                 gain_ess=ess,
                 gain_nominal_weight=nominal_weight,
+                gain_grad_max=grad_max,
+                cost_spread=spread,
             )
 
         # The state this solve intends to reach next: one control period from
@@ -271,7 +288,7 @@ class FeedbackMPPI(SamplingBasedController):
 
     def _compute_gains(
         self, state: mjx.Data, rollouts: Trajectory
-    ) -> Tuple[jax.Array, jax.Array, jax.Array]:
+    ) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
         """K = du*/dx₀: sensitivity of the first applied control to the state.
 
         Returns (K, ESS, nominal weight); the last two are the V-A3
@@ -321,6 +338,11 @@ class FeedbackMPPI(SamplingBasedController):
             lambda controls: self._rollout_cost_gradient(state, controls)
         )(rollouts.controls[batch])  # (num_gain_samples, nq + nv)
         gradients = jnp.nan_to_num(gradients)
+        norms = jnp.linalg.norm(gradients, axis=1)
+        limit = GRADIENT_CLIP_FACTOR * jnp.median(norms)
+        gradients = gradients * jnp.minimum(
+            1.0, limit / jnp.maximum(norms, 1e-12)
+        )[:, None]
 
         # sbmpc gains_computation, with lam = 1/temperature
         weights = jax.nn.softmax(-costs[batch] / self.temperature)
@@ -336,7 +358,17 @@ class FeedbackMPPI(SamplingBasedController):
             "bi,bo->oi", weights_grad, samples_delta
         )
         ess = 1.0 / jnp.sum(jnp.square(weights))
-        return jnp.nan_to_num(gains), ess, weights[0]
+        batch_costs = costs[batch]
+        spread = (jnp.max(batch_costs) - jnp.min(batch_costs)) / (
+            jnp.abs(jnp.min(batch_costs)) + 1e-12
+        )
+        return (
+            jnp.nan_to_num(gains),
+            ess,
+            weights[0],
+            jnp.max(jnp.abs(gradients)),
+            spread,
+        )
 
     def _rollout_cost_gradient(
         self, state: mjx.Data, controls: jax.Array
