@@ -427,6 +427,16 @@ class PandaPregrasp(Task):
         return np.clip(tau, -tau_max, tau_max)
 
 
+    def friction_feedforward(self, v: np.ndarray) -> np.ndarray:
+        """Torque cancelling the plant's joint friction; zeros if it is modelled.
+
+        ``friction_ff_tau`` is zero whenever with_frictionloss is True, so this
+        is identically zero for a planner that already models friction.
+        """
+        return FRICTION_FF_FRACTION * self.friction_ff_tau * np.tanh(
+            np.asarray(v, dtype=np.float64).reshape(-1) / FRICTION_FF_V_EPS
+        )
+
     @staticmethod
     def plan_userdata(q0: np.ndarray, duration: float) -> np.ndarray:
         """Pack the plan parameters for mjx.Data.userdata: [q0, duration]."""
