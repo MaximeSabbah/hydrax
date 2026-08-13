@@ -9,17 +9,12 @@ from mujoco import mjx
 
 from hydrax import ROOT
 from hydrax.task_base import Task
-
-
-# Activations selectable by PandaPregraspOptions.cost_activation, applied to
-# each squared residual |r|^2. Crocoddyl's ActivationModel, in the two forms
-# this task has used.
-_ACTIVATIONS = {
-    # ActivationModelWeightedQuad: a(r) = 0.5 r^T diag(w) r, Hessian diag(w)
-    "quadratic": lambda squared_error: 0.5 * squared_error,
-    # Bounds each term to [0, 1); curvature -> 0 as the error grows
-    "saturated": lambda squared_error: 1.0 - jnp.exp(-squared_error),
-}
+from hydrax.cost_residuals import (
+    ACTIVATIONS,
+    CostTerm,
+    build_cost_terms,
+    cost_sum,
+)
 
 # Friction feedforward, live only when with_frictionloss is False. The plant
 # (sim and FR3) keeps its identified joint friction, so a frictionless planning
@@ -34,43 +29,47 @@ FRICTION_FF_V_EPS = 0.04
 class PandaPregraspOptions:
     """Configuration options for the PandaPregrasp task."""
 
-    # --- Cost weights ---
+    # --- Cost ---
     #
-    # ABSOLUTE weights of a quadratic (crocoddyl-style) cost: they are used
-    # as given, NOT normalized against each other. Their ratio sets the
-    # trade-off and their scale sets the cost's curvature, which is what the
-    # sampling temperature is measured against -- so changing them requires
-    # revisiting solver.temperature.
+    # The cost is crocoddyl's CostModelSum: one weighted residual per entry,
+    # picked by name from hydrax.tasks.cost_residuals.RESIDUALS. Which terms
+    # are present IS the controller definition, so it is set by the
+    # `costs.running` / `costs.terminal` blocks of the tuning yaml rather
+    # than by editing running_cost(). See doc/cost_residuals.md.
     #
-    # Proportions follow crocoddyl's canonical reaching OCPs (tracking 10,
-    # state regularization 1e-1, control regularization 1e-4): the control
-    # term is a regularizer, orders of magnitude below the tracking terms,
-    # not a co-equal objective.
+    # Weights are ABSOLUTE: used as given, NOT normalized against each other.
+    # Their ratio sets the trade-off and their scale sets the cost's
+    # curvature, which is what the sampling temperature is measured against
+    # -- so changing them requires revisiting solver.temperature.
+    #
+    # The defaults are the configuration that measured 1.6 mm terminal in
+    # sim: crocoddyl's canonical reaching proportions (tracking 10, state
+    # regularization 1e-1, control regularization 1e-4), tracking a joint
+    # plan. The terminal drops the control term, as crocoddyl's terminal
+    # CostModelSum does -- there is no control at that node to regularize.
+    running_costs: Tuple[CostTerm, ...] = (
+        CostTerm("joint_position_plan", (10.0,)),
+        CostTerm("joint_velocity_plan", (0.1,)),
+        CostTerm("control_grav", (1e-4,)),
+    )
+    terminal_costs: Tuple[CostTerm, ...] = (
+        CostTerm("joint_position_plan", (10.0,)),
+        CostTerm("joint_velocity_plan", (0.1,)),
+    )
 
-    # Which activation wraps each weighted squared residual, mirroring
+    # Which activation wraps each term's weighted squared residual, mirroring
     # crocoddyl's pluggable ActivationModel (the residual, the weights and
     # the activation are three separate choices there, so they are here too):
     #
-    #   "quadratic" -> 0.5 * |r|^2   — crocoddyl's ActivationModelWeightedQuad,
-    #                  constant Hessian, the default and what the weights
-    #                  below are tuned for.
-    #   "saturated" -> 1 - exp(-|r|^2)  — bounds each term to [0, 1]. Kept
-    #                  available, but note its curvature vanishes as the
+    #   "quadratic" -> 0.5 * Σ w_i r_i²   — crocoddyl's
+    #                  ActivationModelWeightedQuad, constant Hessian, the
+    #                  default and what the weights above are tuned for.
+    #   "saturated" -> 1 - exp(-Σ w_i r_i²)  — bounds each term to [0, 1).
+    #                  Kept available, but note its curvature vanishes as the
     #                  error grows, which is what made the OCP blind to the
-    #                  control (see running_cost). If you select it, retune
-    #                  the weights and solver.temperature with it.
+    #                  control (see cost_residuals.cost_sum). If you select
+    #                  it, retune the weights and solver.temperature with it.
     cost_activation: str = "quadratic"
-
-    # Joint configuration (qpos) tracking
-    configuration_cost_weight: float = 10.0
-
-    # Joint velocity (qvel) tracking
-    velocity_cost_weight: float = 0.1
-
-    # Control regularization around the feedforward torque plan, scaled by
-    # the torque limits so the error is dimensionless (equivalently, a
-    # crocoddyl weighted-quadratic activation with w_i = 1 / tau_max_i^2)
-    control_cost_weight: float = 1e-4
 
     # --- Task geometry ---
 
@@ -288,24 +287,33 @@ class PandaPregrasp(Task):
         self.reference_ctrl = jnp.array(tau_plan, dtype=jnp.float32)
         self.tau_max = jnp.array(options.tau_max, dtype=jnp.float32)
 
-        # Cost weights are used as given. They are deliberately NOT
-        # normalized to sum to 1: that normalization made the weights nearly
-        # untunable, since w_q was already 0.90 of the total and could only
-        # ever reach 1.0 -- a hard ceiling of 1.111x no matter what value the
-        # yaml held, whatever the intent (measured 2026-08-07; it explains
-        # the earlier finding that configuration_weight x10 moved the gains
-        # by only 1.08x). It also hid the absolute cost scale that the
-        # sampling temperature has to be matched against.
-        self.configuration_cost_weight = options.configuration_cost_weight
-        self.velocity_cost_weight = options.velocity_cost_weight
-        self.control_cost_weight = options.control_cost_weight
-
-        if options.cost_activation not in _ACTIVATIONS:
+        if options.cost_activation not in ACTIVATIONS:
             raise ValueError(
                 f"unknown cost_activation {options.cost_activation!r}; "
-                f"expected one of {sorted(_ACTIVATIONS)}"
+                f"expected one of {sorted(ACTIVATIONS)}"
             )
         self.cost_activation = options.cost_activation
+
+        # Resolve the yaml's term list against this model: lengths checked,
+        # scalar weights broadcast, control terms rejected at the terminal.
+        # Weights are used as given and are deliberately NOT normalized to
+        # sum to 1 -- that normalization made them nearly untunable, since
+        # w_q was already 0.90 of the total and could only ever reach 1.0, a
+        # hard ceiling of 1.111x no matter what the yaml held (measured
+        # 2026-08-07; it explains the earlier finding that
+        # configuration_weight x10 moved the gains by only 1.08x). It also
+        # hid the absolute cost scale the sampling temperature is matched
+        # against.
+        #
+        # Composition happens here, at construction, so a term the yaml
+        # omits is absent from the compiled graph rather than multiplied
+        # by zero in it.
+        self._running_terms = build_cost_terms(
+            self, options.running_costs, "costs.running", allow_control=True
+        )
+        self._terminal_terms = build_cost_terms(
+            self, options.terminal_costs, "costs.terminal", allow_control=False
+        )
 
     @staticmethod
     def _derive_arm_planning_model(
@@ -474,30 +482,13 @@ class PandaPregrasp(Task):
         return q0 + s * dq, ds * dq
 
     def running_cost(self, state: mjx.Data, control: jax.Array) -> jax.Array:
-        """The running cost ℓ(xₜ, uₜ)."""
-        # Tracking errors against the plan carried on userdata
-        q_ref, v_ref = self._reference(state)
-        q_err = state.qpos - q_ref  # size (nq,)
-        v_err = state.qvel - v_ref  # size (nv,)
-
-        # Control regularization about gravity compensation, per-joint
-        # normalized so the strong shoulder joints (87 Nm) and the wrist
-        # (12 Nm) compare. This is crocoddyl's ResidualModelControlGrav
-        # (u - g(q)) up to one difference: qfrc_bias is MuJoCo's full bias
-        # force C(q,v)v + g(q), so it also carries Coriolis, where crocoddyl
-        # uses computeGeneralizedGravity(q) alone. Isolating gravity would
-        # need a second forward pass with qvel zeroed on every rollout step
-        # of every sample; measured along this plan the two differ by at
-        # most 0.048% of tau_max (peak plan speed is capped at 20% of the
-        # velocity limits), contributing ~2e-11 to the cost at this weight.
-        u_err = (control - state.qfrc_bias) / self.tau_max  # size (nu,)
-
-        # Weighted sum of the activated squared residuals — crocoddyl's
-        # CostModelSum over three CostModelResidual terms.
+        """The running cost ℓ(xₜ, uₜ): the `costs.running` terms."""
+        # Which residuals are summed here is a yaml decision, not a code one
+        # -- see cost_residuals.RESIDUALS and doc/cost_residuals.md.
         #
         # The default "quadratic" activation is ActivationModelWeightedQuad
-        # (0.5 |r|^2, constant Hessian). It replaced "saturated"
-        # (1 - exp(-|r|^2)) as the default because that form's curvature
+        # (0.5 Σ w_i r_i², constant Hessian). It replaced "saturated"
+        # (1 - exp(-Σ w_i r_i²)) as the default because that form's curvature
         # vanishes as the error grows: measured at the state where the real
         # FR3 parks, d2J/du2 was ~1e-4 with three NEGATIVE entries, so the
         # optimizer could not see the control. On hardware that showed up as
@@ -506,43 +497,35 @@ class PandaPregrasp(Task):
         # 0.33-0.89 N.m breakaway friction — and the arm crept instead of
         # moving. The quadratic form measures 1.7-2.5x breakaway with zero
         # sign flips at that same state (2026-08-07).
-        activation = _ACTIVATIONS[self.cost_activation]
-        return (
-            self.configuration_cost_weight * activation(jnp.sum(jnp.square(q_err)))
-            + self.velocity_cost_weight * activation(jnp.sum(jnp.square(v_err)))
-            + self.control_cost_weight * activation(jnp.sum(jnp.square(u_err)))
+        return cost_sum(
+            self, self._running_terms, state, control, self.cost_activation
         )
 
     def terminal_cost(self, state: mjx.Data) -> jax.Array:
-        """The terminal cost ϕ(x_T)."""
-        # The same cost as the running costs, evaluated at the feedforward
-        # control (zero control error), and NOT scaled by dt.
-        #
-        # This mirrors crocoddyl's integration convention: running nodes are
-        # IntegratedActionModelEuler(model, dt) and contribute dt*l(x,u),
-        # while the terminal node is IntegratedActionModelEuler(model, 0.0)
-        # and contributes l_T(x) unscaled. alg_base already applies that
-        # split (it sums dt*running_cost over the rollout and adds
-        # terminal_cost once), so the dt here was a second scaling that made
-        # the terminal cost weigh the SAME as one running step -- 1/dt = 25x
-        # weaker than the convention, leaving nothing that rewards arriving.
-        #
-        # Measured (2026-08-07, closed-loop offline, 3 seeds, plant at the
-        # sbmpc_ros sim settings): removing this factor moves the reach from
-        # 66.7 mm to 9.4 mm at t = 11.5 s, and the time to cross 10 mm from
-        # ~60 s to ~13 s. Torque and velocity margins are unchanged
-        # (max 0.33 of the torque limit, 0.12 of the velocity limit).
-        #
-        # The control term is dropped, as crocoddyl's terminal CostModelSum
-        # drops its control regularization: there is no control at the
-        # terminal node to regularize.
-        q_ref, v_ref = self._reference(state)
-        q_err = state.qpos - q_ref
-        v_err = state.qvel - v_ref
-        activation = _ACTIVATIONS[self.cost_activation]
-        return (
-            self.configuration_cost_weight * activation(jnp.sum(jnp.square(q_err)))
-            + self.velocity_cost_weight * activation(jnp.sum(jnp.square(v_err)))
+        """The terminal cost ϕ(x_T): the `costs.terminal` terms, NOT dt-scaled.
+
+        The absent dt mirrors crocoddyl's integration convention: running
+        nodes are IntegratedActionModelEuler(model, dt) and contribute
+        dt*l(x,u), while the terminal node is
+        IntegratedActionModelEuler(model, 0.0) and contributes l_T(x)
+        unscaled. alg_base already applies that split (it sums dt*running_cost
+        over the rollout and adds terminal_cost once), so a dt here was a
+        second scaling that made the terminal cost weigh the SAME as one
+        running step -- 1/dt = 25x weaker than the convention, leaving nothing
+        that rewards arriving.
+
+        Measured (2026-08-07, closed-loop offline, 3 seeds, plant at the
+        sbmpc_ros sim settings): removing that factor moved the reach from
+        66.7 mm to 9.4 mm at t = 11.5 s, and the time to cross 10 mm from
+        ~60 s to ~13 s. Torque and velocity margins were unchanged (max 0.33
+        of the torque limit, 0.12 of the velocity limit).
+
+        Control-dependent residuals are rejected from this block at
+        construction, as crocoddyl's terminal CostModelSum drops its control
+        regularization: there is no control at this node to regularize.
+        """
+        return cost_sum(
+            self, self._terminal_terms, state, None, self.cost_activation
         )
 
     def domain_randomize_model(self, rng: jax.Array) -> Dict[str, jax.Array]:

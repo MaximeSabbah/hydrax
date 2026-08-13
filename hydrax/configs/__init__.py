@@ -12,6 +12,7 @@ load the same file.
 from typing import Tuple
 
 from hydrax import ROOT
+from hydrax.cost_residuals import parse_cost_terms
 from hydrax.tasks.panda_pick_place import (
     PandaPickPlaceOptions,
     PickPlaceControllerConfig,
@@ -29,9 +30,10 @@ PICK_PLACE_CONFIG_YAML = ROOT + "/configs/pick_place.yaml"
 _PREGRASP_YAML_SCHEMA = {
     "costs": {
         "activation": ("options", "cost_activation"),
-        "configuration_weight": ("options", "configuration_cost_weight"),
-        "velocity_weight": ("options", "velocity_cost_weight"),
-        "control_weight": ("options", "control_cost_weight"),
+        # Term lists, not scalars: parsed by cost_residuals.parse_cost_terms
+        # rather than assigned straight through (see _PREGRASP_TERM_KEYS).
+        "running": ("options", "running_costs"),
+        "terminal": ("options", "terminal_costs"),
     },
     "solver": {
         "num_samples": ("config", "num_samples"),
@@ -98,6 +100,13 @@ _PICK_PLACE_YAML_SCHEMA = {
 }
 
 
+# yaml (section, key) whose value is a cost term list rather than a plain
+# value. The generic loader would assign the raw dict straight to the
+# dataclass field; these go through parse_cost_terms instead, which is what
+# rejects an unknown residual name or a missing/duplicated reference.
+_TERM_LIST_KEYS = {("costs", "running"), ("costs", "terminal")}
+
+
 def _load_yaml_values(path: str, schema: dict, label: str) -> dict:
     """Bind a tuning yaml to a schema; unknown sections/keys are an error."""
     import yaml
@@ -118,7 +127,12 @@ def _load_yaml_values(path: str, schema: dict, label: str) -> dict:
             )
         for key, value in keys.items():
             target, field_name = section_schema[key]
-            values[target][field_name] = value
+            bound = (
+                parse_cost_terms(value, f"{section}.{key}")
+                if (section, key) in _TERM_LIST_KEYS
+                else value
+            )
+            values[target][field_name] = bound
     return values
 
 

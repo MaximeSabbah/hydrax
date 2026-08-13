@@ -1,32 +1,50 @@
-# Pregrasp OCP tuning — THE single tuning surface for the Tier A gates,
-# the ROS simulation, and the real robot (all consumers load this file
-# through hydrax.tasks.panda_pregrasp.load_pregrasp_config; nothing can
-# override it from the ROS parameter layer).
+# Pregrasp OCP tuning 
+
+# The cost is crocoddyl's CostModelSum: one weighted residual per entry
+# below. THE TERM LIST IS THE CONTROLLER — swapping which residuals appear
+# here changes what is optimized, with no code change. Residual names, their
+# formulas and the rules for `reference` are in doc/cost_residuals.md; an
+# unknown name is an error listing the available ones.
 #
-# Values only: cost functions and everything not listed here (goal pose,
-# robot limits, domain randomization) are code, in PandaPregraspOptions /
-# PregraspControllerConfig, and changing them is a reviewed code change.
-# Unknown keys in this file are an error.
+# An entry is either the weight on its own, or a mapping when the residual
+# needs a constant reference:
 #
-# The committed values are the configuration certified by the Tier A gates
-# (doc/feedback_mppi_panda_port_plan.md). Tune freely for experiments —
-# both the Tier A example and the ROS bringup read the same file — and
-# rerun the gates before trusting a changed value.
+#   control_grav: 0.0001
+#   joint_position_plan: [10, 10, 10, 10, 10, 10, 1.0]   # per-joint weights
+#   joint_position:
+#     weight: 1.0
+#     reference: [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
+#
+# A `_plan` suffix means the reference is the time-varying quintic joint plan
+# carried on userdata; the unsuffixed name means a constant that must be given
+# explicitly here — there is no default reference.
 
 costs:
-  # Activation applied to each squared residual (crocoddyl's ActivationModel):
-  #   quadratic -> 0.5|r|^2, constant Hessian (ActivationModelWeightedQuad)
-  #   saturated -> 1 - exp(-|r|^2), bounded to [0,1) but its curvature decays
-  #                to zero, which blinds the OCP to the control
-  # Weights below are ABSOLUTE (not normalized against each other) and are
-  # tuned for `quadratic`; selecting `saturated` needs them and `temperature`
+  # Activation applied to each term's weighted squared residual (crocoddyl's
+  # ActivationModel):
+  #   quadratic -> 0.5 * sum_i w_i r_i^2, constant Hessian
+  #                (ActivationModelWeightedQuad)
+  #   saturated -> 1 - exp(-sum_i w_i r_i^2), bounded to [0,1) but its
+  #                curvature decays to zero, which blinds the OCP to the
+  #                control
+  # Weights are ABSOLUTE (not normalized against each other) and are tuned
+  # for `quadratic`; selecting `saturated` needs them and `temperature`
   # retuned together.
   activation: quadratic
+
   # Proportions from crocoddyl's canonical reaching OCPs: tracking 10,
   # state regularization 1e-1, control regularization 1e-4.
-  configuration_weight: 10.0
-  velocity_weight: 0.1
-  control_weight: 0.0001
+  running:
+    joint_position_plan: 10.0
+    joint_velocity_plan: 0.1
+    control_grav: 0.0001
+
+  # The terminal drops the control term, as crocoddyl's terminal CostModelSum
+  # does: there is no control at that node to regularize. A control-dependent
+  # residual here is an error.
+  terminal:
+    joint_position_plan: 10.0
+    joint_velocity_plan: 0.1
 
 solver:
   num_samples: 1024
@@ -39,13 +57,7 @@ solver:
   iterations: 1
   num_gain_samples: 256 # gain batch: zero-noise nominal + lowest-cost samples
 
-# MuJoCo's Newton budget for the derived planning model. Contacts are
-# disabled there, so before the identified joint friction the model carried
-# no constraints and these were free at MuJoCo's 100/50 default. Friction
-# adds one constraint per joint and MJX runs every iteration it is given, on
-# every sample of every rollout step: 100/50 measured ~125 ms per control
-# step against the 40 ms budget, 5/8 measured ~29 ms.
-#
+# MuJoCo's Newton budget for the derived planning model. 
 # 5/8 converges the seven friction constraints to machine precision
 # (2.8e-17 rad over one 8-step horizon). Lowering further is a false
 # economy — the line search binds first, so 3/5 costs 7.1e-3 rad and 2/4
