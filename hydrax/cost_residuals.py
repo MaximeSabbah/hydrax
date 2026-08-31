@@ -137,6 +137,69 @@ def _control_grav(
     return (control - state.qfrc_bias) / task.tau_max
 
 
+def _ee_translation(
+    task: Task,
+    state: mjx.Data,
+    control: Optional[jax.Array],
+    reference: Optional[jax.Array],
+) -> jax.Array:
+    return state.site_xpos[task.gripper_site_id] - task._goal_pos(state)
+
+
+# Floor on |v|^2 below. Two jobs, both about the differentiated path rather
+# than the forward value: jnp.linalg.norm has a NaN gradient at zero, and the
+# division below is 0/0 at zero rotation. Squared, so it is (1e-12)^2.
+_LOG_EPS_SQ = 1e-24
+
+
+def so3_log(rotation: jax.Array) -> jax.Array:
+    """Rotation vector of a rotation matrix — pinocchio/crocoddyl ``log3``.
+
+    Returns ``theta * axis`` (3,), the geodesic error on SO(3).
+
+    Written as ``theta * v / |v|`` where ``v = vee(skew(R)) = sin(theta)*axis``,
+    rather than the textbook ``theta/(2 sin theta) * v``. The two agree
+    exactly, but this form keeps the MAGNITUDE equal to ``theta`` by
+    construction instead of leaving it to a small-angle series, so it is right
+    at theta = 0 with no Taylor branch and it degrades gracefully rather than
+    silently reporting zero error at a large one.
+
+    ``theta`` comes from ``arctan2(|v|, cos theta)``, not ``arccos``: arccos is
+    ill-conditioned exactly where this residual spends its life (small errors,
+    trace near 3) and its derivative is infinite there.
+
+    **Limit:** within ~1e-6 rad of theta = pi, ``v`` underflows the floor and
+    the axis direction is lost (the magnitude degrades toward 0 rather than
+    pi). That neighbourhood is the genuine singularity of log3 — pinocchio
+    special-cases it via the symmetric part of R. Resolving it here would need
+    a Shepperd-style quaternion branch; worth adding if orientation errors near
+    180 degrees ever become reachable for this task.
+    """
+    v = 0.5 * jnp.stack(
+        [
+            rotation[2, 1] - rotation[1, 2],
+            rotation[0, 2] - rotation[2, 0],
+            rotation[1, 0] - rotation[0, 1],
+        ]
+    )
+    # Floored BEFORE the sqrt: sqrt has an infinite derivative at 0, so
+    # clamping afterwards would still produce a NaN gradient at zero rotation.
+    norm = jnp.sqrt(jnp.maximum(jnp.sum(v * v), _LOG_EPS_SQ))
+    cos_theta = 0.5 * (jnp.trace(rotation) - 1.0)
+    theta = jnp.arctan2(norm, cos_theta)
+    return theta * v / norm
+
+
+def _ee_rotation(
+    task: Task,
+    state: mjx.Data,
+    control: Optional[jax.Array],
+    reference: Optional[jax.Array],
+) -> jax.Array:
+    rotation = state.site_xmat[task.gripper_site_id]
+    return so3_log(task._goal_rot(state).T @ rotation)
+
+
 # name -> spec. The single source of what a yaml may ask for; an unknown name
 # is an error listing this table, so a typo can never become a silent no-op.
 RESIDUALS: Dict[str, ResidualSpec] = {
@@ -190,6 +253,37 @@ RESIDUALS: Dict[str, ResidualSpec] = {
         uses_control=True,
         fn=_control_grav,
     ),
+    # crocoddyl's ResidualModelFrameTranslation on the gripper site. The goal
+    # is read from userdata, not from a construction constant, so a goal that
+    # moves (vision) does not produce a new HLO and a full recompile.
+    #
+    # It is 3 rows in a 7-DoF space, so its Gauss-Newton curvature J^T W J has
+    # rank <= 3: on its own it leaves a 4-dimensional null space the sampler
+    # explores with NO cost signal, where K = du/dx0 is noise. Keep a
+    # non-zero joint or posture term alongside it -- that is what conditions
+    # the gain, which is the point of the whole project.
+    "ee_translation": ResidualSpec(
+        formula="p_gripper(q) - p_goal",
+        dim=3,
+        reference="goal",
+        uses_control=False,
+        fn=_ee_translation,
+    ),
+    # crocoddyl's ResidualModelFrameRotation. Together with ee_translation this
+    # is ResidualModelFramePlacement, split so the two can be weighted apart --
+    # they have different units (m vs rad) and different task tolerances.
+    #
+    # Orientation is NOT optional for a grasp: with ee_translation alone it is
+    # held only implicitly by the joint term, and dropping that term's weight
+    # 10 -> 1 measured terminal orientation 2x worse and a 0.291 rad excursion
+    # mid-reach (2026-08-13, pregrasp_mujoco_20260813T164721Z).
+    "ee_rotation": ResidualSpec(
+        formula="log3(R_goal^T R_gripper)",
+        dim=3,
+        reference="goal",
+        uses_control=False,
+        fn=_ee_rotation,
+    ),
 }
 
 
@@ -204,13 +298,16 @@ class CostTerm:
     name: str
     weight: Tuple[float, ...]
     reference: Optional[Tuple[float, ...]] = None
+    epsilon: Optional[float] = None
 
 
 # What build_cost_terms hands to cost_sum: per term, the broadcast weight
 # vector, the constant reference (None unless the yaml gave one) and the
 # residual itself. Resolved once at construction, so the compiled cost
 # contains exactly the terms the yaml asked for.
-BuiltTerms = Tuple[Tuple[jax.Array, Optional[jax.Array], "Residual"], ...]
+BuiltTerms = Tuple[
+    Tuple[jax.Array, Optional[jax.Array], Optional[float], "Residual"], ...
+]
 
 
 def _as_tuple(value: object, what: str, where: str) -> Tuple[float, ...]:
@@ -258,14 +355,22 @@ def parse_cost_terms(block: object, label: str) -> Tuple[CostTerm, ...]:
             )
         spec = RESIDUALS[name]
 
+        epsilon = None
         if isinstance(entry, dict):
-            unknown = set(entry) - {"weight", "reference"}
+            unknown = set(entry) - {"weight", "reference", "epsilon"}
             if unknown:
                 raise ValueError(f"{where}: unknown keys {sorted(unknown)}")
             if "weight" not in entry:
                 raise ValueError(f"{where}: missing 'weight'")
             weight = _as_tuple(entry["weight"], "weight", where)
             reference = entry.get("reference")
+            if "epsilon" in entry:
+                epsilon = float(entry["epsilon"])
+                if epsilon <= 0.0:
+                    raise ValueError(
+                        f"{where}: epsilon must be > 0 (it is the SQUARE of "
+                        f"the residual value where the cost turns quadratic)"
+                    )
         else:
             weight = _as_tuple(entry, "weight", where)
             reference = None
@@ -290,7 +395,14 @@ def parse_cost_terms(block: object, label: str) -> Tuple[CostTerm, ...]:
                 f"its name."
             )
 
-        terms.append(CostTerm(name=name, weight=weight, reference=reference))
+        terms.append(
+            CostTerm(
+                name=name,
+                weight=weight,
+                reference=reference,
+                epsilon=epsilon,
+            )
+        )
     return tuple(terms)
 
 
@@ -342,7 +454,7 @@ def build_cost_terms(
                 )
             reference = jnp.asarray(term.reference, dtype=jnp.float32)
 
-        built.append((weight, reference, spec.fn))
+        built.append((weight, reference, term.epsilon, spec.fn))
     return tuple(built)
 
 
@@ -353,17 +465,36 @@ def cost_sum(
     control: Optional[jax.Array],
     activation: str,
 ) -> jax.Array:
-    """Σ_terms a( Σ_i w_i r_i² ) over the built terms.
+    """Sum the built terms, each either quadratic or smooth-L1.
 
-    The weights sit INSIDE the activation, which is crocoddyl's
-    ActivationModelWeightedQuad convention. For "quadratic" this is identical
-    to a scalar weight outside it; for "saturated" it is not — that form
-    bounds each term to [0, 1) whatever its weight, so scaling it inside is
-    the only thing that changes the term's influence at all.
+    A term with no ``epsilon`` uses the global activation on its weighted
+    squared residual, ``a(Σ_i w_i r_i²)``. The weights sit INSIDE the
+    activation, crocoddyl's ActivationModelWeightedQuad convention: for
+    "quadratic" that is identical to a scalar weight outside it; for
+    "saturated" it is not, since that form bounds each term to [0, 1)
+    whatever its weight.
+
+    A term WITH ``epsilon`` uses crocoddyl's ActivationModelSmooth1Norm,
+    ``Σ_i w_i (√(r_i² + ε) − √ε)``, per component. The subtraction only makes
+    the term vanish at r = 0 so costs stay comparable; it changes no gradient.
+
+    The point of the smooth-L1 form is the gradient: ``w·r/√(r² + ε)``, which
+    tends to a CONSTANT w for |r| ≫ √ε instead of decaying to zero like the
+    quadratic's ``w·r``. A quadratic cost's pull fades as the error shrinks,
+    so below some radius it can no longer command the breakaway torque and the
+    joint stops -- measured on hardware at |tau - gravity| / breakaway = 0.62
+    on every run. A constant pull has no such radius; what replaces it is √ε,
+    which is chosen rather than imposed by friction.
     """
     activate = ACTIVATIONS[activation]
     total = jnp.zeros(())
-    for weight, reference, fn in built:
+    for weight, reference, epsilon, fn in built:
         residual = fn(task, state, control, reference)
-        total = total + activate(jnp.sum(weight * jnp.square(residual)))
+        if epsilon is None:
+            total = total + activate(jnp.sum(weight * jnp.square(residual)))
+        else:
+            smooth_abs = jnp.sqrt(jnp.square(residual) + epsilon)
+            total = total + jnp.sum(
+                weight * (smooth_abs - jnp.sqrt(epsilon))
+            )
     return total

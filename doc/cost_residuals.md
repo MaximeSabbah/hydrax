@@ -26,14 +26,18 @@ cannot drift apart.
 | `joint_velocity_plan` | `v − v_ref(t)` | nv | plan on userdata | `ResidualModelState`, per-node ref |
 | `control` | `(u − u_ref) / τ_max` | nu | `reference:` (required) | `ResidualModelControl` |
 | `control_grav` | `(u − qfrc_bias) / τ_max` | nu | the state | `ResidualModelControlGrav` |
+| `ee_translation` | `p_gripper(q) − p_goal` | 3 | goal on userdata | `ResidualModelFrameTranslation` |
+| `ee_rotation` | `log3(R_goalᵀ · R_gripper)` | 3 | goal on userdata | `ResidualModelFrameRotation` |
 
 Planned, documented here so the names are fixed before they exist:
 
 | yaml name | residual `r` | dim | reference from | status |
 |---|---|---|---|---|
-| `ee_translation` | `p_ee(q) − p_goal` | 3 | goal on userdata | step B |
-| `ee_rotation` | `log(R_goalᵀ · R_ee)` | 3 | goal on userdata | not implemented |
 | `path_deviation` | `q − proj_[q₀,goal](q)` | nq (rank nq−1) | plan segment on userdata | not implemented |
+
+`ee_translation` + `ee_rotation` together are crocoddyl's
+`ResidualModelFramePlacement`, kept as two entries so they can be weighted
+apart — they have different units (m vs rad) and different task tolerances.
 
 ### Notes per residual
 
@@ -49,6 +53,34 @@ Planned, documented here so the names are fixed before they exist:
   difference: `qfrc_bias` is MuJoCo's full bias force `C(q,v)v + g(q)`, where
   crocoddyl uses `computeGeneralizedGravity(q)` alone. Measured along this
   task's plan the two differ by at most 0.048% of `τ_max`.
+- **`ee_translation`** is the task metric itself, and the only residual whose
+  value is not a joint quantity. It reads `state.site_xpos[gripper]`, which
+  `trace_sites=["gripper"]` already puts in the rollout, so it costs a lookup
+  rather than a kinematics pass. Its goal comes from userdata so a moving
+  (vision) target does not recompile. **It is 3 rows in a 7-DoF space**, so its
+  Gauss-Newton curvature `JᵀWJ` has rank ≤ 3 and leaves a 4-dimensional null
+  space with no cost signal; keep a non-zero joint or posture term alongside
+  it, or `K = du/dx₀` is noise in those directions.
+- **`ee_rotation`** is the geodesic error on SO(3), `θ·axis`. It is **not**
+  optional for a grasp: with `ee_translation` alone, orientation is held only
+  implicitly by the joint term, and dropping that term's weight 10 → 1 measured
+  terminal orientation 2× worse with a 0.291 rad excursion mid-reach
+  (`pregrasp_mujoco_20260813T164721Z`, 2026-08-13).
+
+  Two properties worth knowing, both measured in **float32**, the dtype the
+  rollout actually runs in.
+
+  **Its Jacobian diverges as `1/(π−θ)`.** Intrinsic to `log3`, not to this
+  implementation — pinocchio's `Jlog3` does the same. Measured `max|∂log/∂R|`:
+  0.5 at θ ≤ 1 rad, 1.1 at 2 rad, 10.6 at 3 rad, 1.7e4 within 1e-4 of π.
+  Harmless at this task's operating point (errors ≤ 0.3 rad → 0.51), but a
+  route to a large `∂J/∂x₀` if orientation errors near 180° become reachable.
+
+  **Accuracy degrades smoothly toward θ = π**, it does not explode: worst error
+  against `scipy.as_rotvec` is 4.8e-7 rad at θ ≤ 3.0, 1.7e-6 at π−0.04,
+  5.6e-5 at π−1.6e-3, 8.5e-4 at π−9.3e-5. Within ~1e-6 rad of π the axis is
+  lost outright and the magnitude falls toward 0 instead of π — the genuine
+  singularity, which pinocchio special-cases via the symmetric part of R.
 - **`path_deviation`** will penalize distance to the *path* rather than to the
   time-indexed trajectory, so falling behind schedule costs nothing. Because
   the plan is a straight segment in joint space the projection is closed-form

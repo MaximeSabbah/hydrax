@@ -8,13 +8,13 @@ import numpy as np
 from mujoco import mjx
 
 from hydrax import ROOT
-from hydrax.task_base import Task
 from hydrax.cost_residuals import (
     ACTIVATIONS,
     CostTerm,
     build_cost_terms,
     cost_sum,
 )
+from hydrax.task_base import Task
 
 # Friction feedforward, live only when with_frictionloss is False. The plant
 # (sim and FR3) keeps its identified joint friction, so a frictionless planning
@@ -287,6 +287,15 @@ class PandaPregrasp(Task):
         self.reference_ctrl = jnp.array(tau_plan, dtype=jnp.float32)
         self.tau_max = jnp.array(options.tau_max, dtype=jnp.float32)
 
+        # The site the end-effector residuals measure. trace_sites already
+        # makes site_xpos available inside the rollout, so the residual is a
+        # lookup, not an extra kinematics pass.
+        self.gripper_site_id = mujoco.mj_name2id(
+            self.mj_model, mujoco.mjtObj.mjOBJ_SITE, "gripper"
+        )
+        self.goal_pos = jnp.array(options.goal_pos, dtype=jnp.float32)
+        self.goal_rot = jnp.array(options.goal_rot, dtype=jnp.float32)
+
         if options.cost_activation not in ACTIVATIONS:
             raise ValueError(
                 f"unknown cost_activation {options.cost_activation!r}; "
@@ -363,7 +372,9 @@ class PandaPregrasp(Task):
         # than a trace-time constant. That is what makes the compiled rollout
         # plan-agnostic: any start configuration reuses the same executable
         # (and the same compilation-cache entry) instead of recompiling.
-        spec.nuserdata = len(home_q) + 1
+        # userdata layout, see plan_userdata:
+        #   q0 | duration | goal_q | goal_pos | goal_rot (row-major 3x3)
+        spec.nuserdata = 2 * len(home_q) + 13
         model = spec.compile()
         if not with_frictionloss:
             model.dof_frictionloss[:] = 0.0
@@ -445,37 +456,94 @@ class PandaPregrasp(Task):
             np.asarray(v, dtype=np.float64).reshape(-1) / FRICTION_FF_V_EPS
         )
 
-    @staticmethod
-    def plan_userdata(q0: np.ndarray, duration: float) -> np.ndarray:
-        """Pack the plan parameters for mjx.Data.userdata: [q0, duration]."""
-        q0 = np.asarray(q0, dtype=np.float64).reshape(-1)
-        return np.concatenate([q0, [float(duration)]])
+    def plan_userdata(
+        self,
+        q0: np.ndarray,
+        duration: float,
+        goal_q: np.ndarray | None = None,
+        goal_pos: np.ndarray | None = None,
+        goal_rot: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Pack the task parameters for mjx.Data.userdata.
 
-    def _plan_params(self, state: mjx.Data) -> Tuple[jax.Array, jax.Array]:
-        """(q0, duration) of the reference plan, read off the state.
+        Layout:
+        ``[q0 (nq) | duration (1) | goal_q (nq) | goal_pos (3) | goal_rot (9)]``
+        with ``goal_rot`` row-major.
+
+        userdata is a traced field that mjx.step passes through untouched, so
+        everything here is re-parameterizable at runtime WITHOUT recompiling.
+        The goal travels with the plan for exactly that reason: it will come
+        from vision, and a goal baked into the compiled graph would mean a new
+        HLO and a full recompile per goal.
+
+        The goal arguments default to the construction-time goal, so a caller
+        that only re-anchors the plan start keeps the current target.
+        """
+        q0 = np.asarray(q0, dtype=np.float64).reshape(-1)
+        goal_q = self.goal_q if goal_q is None else goal_q
+        goal_pos = self.goal_pos if goal_pos is None else goal_pos
+        goal_rot = self.goal_rot if goal_rot is None else goal_rot
+        return np.concatenate(
+            [
+                q0,
+                [float(duration)],
+                np.asarray(goal_q, dtype=np.float64).reshape(-1),
+                np.asarray(goal_pos, dtype=np.float64).reshape(-1),
+                np.asarray(goal_rot, dtype=np.float64).reshape(-1),
+            ]
+        )
+
+    def _plan_params(
+        self, state: mjx.Data
+    ) -> Tuple[jax.Array, jax.Array, jax.Array]:
+        """(q0, duration, goal_q) of the reference plan, read off the state.
 
         Falls back to the construction-time plan when userdata is unset (all
         zero duration), so the task still works outside the ROS adapter.
         """
         nq = self.model.nq
         q0, duration = state.userdata[:nq], state.userdata[nq]
+        goal_q = state.userdata[nq + 1 : 2 * nq + 1]
         unset = duration <= 0.0
         return (
             jnp.where(unset, jnp.asarray(self.start_q, dtype=q0.dtype), q0),
             jnp.where(unset, self.duration, duration),
+            jnp.where(unset, jnp.asarray(self.goal_q, dtype=q0.dtype), goal_q),
+        )
+
+    def _goal_pos(self, state: mjx.Data) -> jax.Array:
+        """The end-effector goal position, read off the state.
+
+        Same fallback rule as _plan_params: an unset userdata (zero duration)
+        means the construction-time goal.
+        """
+        nq = self.model.nq
+        goal_pos = state.userdata[2 * nq + 1 : 2 * nq + 4]
+        unset = state.userdata[nq] <= 0.0
+        return jnp.where(
+            unset, jnp.asarray(self.goal_pos, dtype=goal_pos.dtype), goal_pos
+        )
+
+    def _goal_rot(self, state: mjx.Data) -> jax.Array:
+        """The end-effector goal orientation (3x3), read off the state."""
+        nq = self.model.nq
+        goal_rot = state.userdata[2 * nq + 4 : 2 * nq + 13].reshape(3, 3)
+        unset = state.userdata[nq] <= 0.0
+        return jnp.where(
+            unset, jnp.asarray(self.goal_rot, dtype=goal_rot.dtype), goal_rot
         )
 
     def _reference(self, state: mjx.Data) -> Tuple[jax.Array, jax.Array]:
         """Minimum-jerk reference (q, v) at state.time, evaluated in closed form.
 
-        The quintic is analytic in its start configuration, so the plan is
-        fully described by (q0, duration) — 8 floats on userdata — instead of
-        a sampled table baked into the compiled graph. Past the plan end it
-        holds the goal at zero velocity, matching the previous table lookup's
-        index clamp.
+        The quintic is analytic in its start and goal, so the plan is fully
+        described by (q0, duration, goal_q) on userdata instead of a sampled
+        table baked into the compiled graph. Past the plan end it holds the
+        goal at zero velocity, matching the previous table lookup's index
+        clamp.
         """
-        q0, duration = self._plan_params(state)
-        dq = self.goal_q - q0
+        q0, duration, goal_q = self._plan_params(state)
+        dq = goal_q - q0
         tau = jnp.clip(state.time / duration, 0.0, 1.0)
         s = 10 * tau**3 - 15 * tau**4 + 6 * tau**5
         ds = (30 * tau**2 - 60 * tau**3 + 30 * tau**4) / duration

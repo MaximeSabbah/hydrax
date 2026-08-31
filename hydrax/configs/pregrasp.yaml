@@ -31,25 +31,25 @@ costs:
   # for `quadratic`; selecting `saturated` needs them and `temperature`
   # retuned together.
   activation: quadratic
-
-  # Proportions from crocoddyl's canonical reaching OCPs: tracking 10,
-  # state regularization 1e-1, control regularization 1e-4.
+  # translation is metres, rotation radians: equal weights cost 1.59 -> 4.24 mm
+  # epsilon = the SQUARE of the residual where the cost turns quadratic and the
+  # pull fades. 1e-6 -> 1 mm, 1e-4 -> 0.01 rad.
   running:
-    joint_position_plan: 10.0
+    joint_position_plan: 1.0
     joint_velocity_plan: 0.1
     control_grav: 0.0001
-
-  # The terminal drops the control term, as crocoddyl's terminal CostModelSum
-  # does: there is no control at that node to regularize. A control-dependent
-  # residual here is an error.
+    ee_translation: {weight: 1.4, epsilon: 1.0e-6}
+    ee_rotation: {weight: 0.3, epsilon: 1.0e-4}
   terminal:
-    joint_position_plan: 10.0
+    joint_position_plan: 1.0
     joint_velocity_plan: 0.1
+    ee_translation: {weight: 1.4, epsilon: 1.0e-6}
+    ee_rotation: {weight: 0.3, epsilon: 1.0e-4}
 
 solver:
   num_samples: 1024
-  noise_scale: 0.03 # 0.03 for frictionloss to true, sampling std = noise_scale * tau_max, per joint
-  temperature: 0.007 # 0.007 for frictionloss to true
+  noise_scale: 0.03 # sampling std = noise_scale * tau_max, per joint
+  temperature: 0.012 # 0.007 for frictionloss to true
   mean_adaptation_rate: 1.0 # <1 damps the hold jitter (partial mean update)
   num_knots: 4
   spline_type: linear # knot interpolation: zero, linear or cubic (gains need knot-linearity); linear measured calmer at the hold than cubic
