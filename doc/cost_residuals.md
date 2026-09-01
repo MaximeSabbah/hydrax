@@ -18,22 +18,61 @@ cannot drift apart.
 
 ## The residuals
 
-| yaml name | residual `r` | dim | reference from | crocoddyl equivalent |
+The **name** says what is measured; **`reference`** says against what. They are
+orthogonal, so every term states both.
+
+| yaml name | residual `r` | dim | `reference:` | crocoddyl equivalent |
 |---|---|---|---|---|
-| `joint_position` | `q − q_ref` | nq | `reference:` (required) | `ResidualModelState` (q part) |
-| `joint_position_plan` | `q − q_ref(t)` | nq | plan on userdata | `ResidualModelState`, per-node ref |
-| `joint_velocity` | `v − v_ref` | nv | `reference:` (required) | `ResidualModelState` (v part) |
-| `joint_velocity_plan` | `v − v_ref(t)` | nv | plan on userdata | `ResidualModelState`, per-node ref |
-| `control` | `(u − u_ref) / τ_max` | nu | `reference:` (required) | `ResidualModelControl` |
-| `control_grav` | `(u − qfrc_bias) / τ_max` | nu | the state | `ResidualModelControlGrav` |
-| `ee_translation` | `p_gripper(q) − p_goal` | 3 | goal on userdata | `ResidualModelFrameTranslation` |
-| `ee_rotation` | `log3(R_goalᵀ · R_gripper)` | 3 | goal on userdata | `ResidualModelFrameRotation` |
+| `joint_position` | `q − q_ref` | nq | `plan` or a vector | `ResidualModelState` (q part) |
+| `joint_velocity` | `v − v_ref` | nv | `plan` or a vector | `ResidualModelState` (v part) |
+| `control` | `(u − u_ref) / τ_max` | nu | `gravity` or a vector | `ResidualModelControlGrav` / `ResidualModelControl` |
+| `ee_translation` | `p_gripper(q) − p_goal` | 3 | `goal` | `ResidualModelFrameTranslation` |
+| `ee_rotation` | `log3(R_goalᵀ · R_gripper)` | 3 | `goal` | `ResidualModelFrameRotation` |
+
+Reference sources:
+
+| keyword | meaning |
+|---|---|
+| `plan` | the time-varying quintic on `userdata`; for `joint_velocity` that is the bell-shaped velocity profile, exactly zero once the plan ends |
+| `gravity` | `qfrc_bias`, MuJoCo's full bias force `C(q,v)v + g(q)` |
+| `goal` | the goal pose on `userdata`, so vision can move it without recompiling |
+| *a vector* | a constant written inline, e.g. `reference: [0, -0.785, 0, -2.356, 0, 1.571, 0.785]` |
+
+## Activations
+
+Per **term**, as in crocoddyl where a cost is
+`CostModelResidual(state, activation, residual)`. There is no problem-wide
+activation.
+
+| `activation:` | formula | crocoddyl |
+|---|---|---|
+| `quadratic` *(default)* | `0.5 Σ wᵢ rᵢ²` | `ActivationModelWeightedQuad` |
+| `smooth_l1` | `Σ wᵢ (√(rᵢ² + knee²) − knee)` | `ActivationModelSmooth1Norm` |
+| `saturated` | `1 − exp(−Σ wᵢ rᵢ²)` | — |
+
+`smooth_l1` requires **`knee`**, in the residual's own units (m, rad, or
+N·m/τ_max). Below it the term is quadratic and the arm settles; above it the
+pull is a constant `w`. **It is the accuracy you choose to stop at**, so it has
+no default.
+
+Why it matters: a quadratic pull is `w·r`, which fades as the error shrinks, so
+below some radius it can no longer command breakaway torque and the joint
+stops — measured on hardware at `|τ − gravity| / breakaway = 0.62` on *every*
+run. The smooth-L1 pull is `w·r/√(r² + knee²)`, constant above the knee, so
+there is no friction-set stall radius; what replaces it is the knee, which is
+chosen. Scale-matched at `w = 1.4` this gave 2.9× *less* drive at arming (a
+smaller lunge) and 8.4× *more* at the stall radius.
+
+`saturated` is kept selectable but not recommended: its curvature vanishes as
+the error grows, which is what once made this OCP blind to the control —
+measured `d²J/du² ≈ 1e-4` with three negative entries where the real FR3
+parked.
 
 Planned, documented here so the names are fixed before they exist:
 
-| yaml name | residual `r` | dim | reference from | status |
-|---|---|---|---|---|
-| `path_deviation` | `q − proj_[q₀,goal](q)` | nq (rank nq−1) | plan segment on userdata | not implemented |
+| yaml name | residual `r` | dim | status |
+|---|---|---|---|
+| `path_deviation` | `q − proj_[q₀,goal](q)` | nq (rank nq−1) | not implemented |
 
 `ee_translation` + `ee_rotation` together are crocoddyl's
 `ResidualModelFramePlacement`, kept as two entries so they can be weighted
@@ -41,18 +80,16 @@ apart — they have different units (m vs rad) and different task tolerances.
 
 ### Notes per residual
 
-- **`_plan` suffix** means the reference is the time-varying quintic joint
-  plan, carried on `mjx.Data.userdata` as `(q₀, duration)` and evaluated in
-  closed form at `state.time`. It is re-anchored on the measured configuration
-  at arming without recompiling.
-- **Both control residuals divide by `τ_max`**, so the strong shoulder joints
-  (87 N·m) and the wrist (12 N·m) compare — equivalently a weighted quadratic
-  with `w_i = 1/τ_max_i²`. A yaml `reference` for `control` is in N·m, i.e.
-  before that scaling.
-- **`control_grav`** is crocoddyl's `ResidualModelControlGrav` up to one
-  difference: `qfrc_bias` is MuJoCo's full bias force `C(q,v)v + g(q)`, where
-  crocoddyl uses `computeGeneralizedGravity(q)` alone. Measured along this
-  task's plan the two differ by at most 0.048% of `τ_max`.
+- **`reference: plan`** is the quintic on `mjx.Data.userdata`, evaluated in
+  closed form at `state.time` and re-anchored on the measured configuration at
+  arming without recompiling.
+- **`control` divides by `τ_max`**, so the strong shoulder joints (87 N·m) and
+  the wrist (12 N·m) compare — equivalently a weighted quadratic with
+  `w_i = 1/τ_max_i²`. A constant `reference` is in N·m, before that scaling.
+  With `reference: gravity` it is crocoddyl's `ResidualModelControlGrav` up to
+  one difference: `qfrc_bias` is MuJoCo's full bias force `C(q,v)v + g(q)`,
+  where crocoddyl uses `computeGeneralizedGravity(q)` alone. Measured along
+  this task's plan the two differ by at most 0.048% of `τ_max`.
 - **`ee_translation`** is the task metric itself, and the only residual whose
   value is not a joint quantity. It reads `state.site_xpos[gripper]`, which
   `trace_sites=["gripper"]` already puts in the rollout, so it costs a lookup
@@ -90,20 +127,29 @@ apart — they have different units (m vs rad) and different task tolerances.
 
 ## Writing an entry
 
-An entry is either the weight on its own:
+Every entry states its weight, its reference and its activation:
 
 ```yaml
-control_grav: 0.0001
-joint_position_plan: [10, 10, 10, 10, 10, 10, 1.0]   # per-joint weights
+joint_position: {weight: 1.0, reference: plan, activation: quadratic}
+control: {weight: 1e-4, reference: gravity, activation: quadratic}
+ee_translation:
+  weight: 1.4
+  reference: goal
+  activation: smooth_l1
+  knee: 0.001                       # metres
 ```
 
-or a mapping, when the residual needs a constant reference:
+`reference` is either a source keyword or a constant vector written inline:
 
 ```yaml
 joint_position:
   weight: 1.0
   reference: [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
+  activation: quadratic
 ```
+
+A bare number is accepted as weight-only shorthand, but only for a residual
+with exactly one possible source, so nothing is ambiguous.
 
 **Weights** may be a scalar (broadcast to every component) or a vector of the
 residual's length. The vector form is crocoddyl's `ActivationModelWeightedQuad`
@@ -120,11 +166,13 @@ cost quietly stops meaning what its name says.
 
 At load (`parse_cost_terms`):
 
-- an unknown residual name — the error lists the registry;
-- a missing `reference` on a residual that has no other source;
-- a `reference` on a residual that already has one (`_plan`, `control_grav`,
-  the `ee_*` terms) — two sources for one reference is exactly the confusion
-  this naming scheme exists to prevent;
+- an unknown residual name, activation, or reference source — each error lists
+  the valid ones;
+- a missing `reference` on a residual with more than one possible source;
+- a constant vector on a residual that accepts none (the `ee_*` terms);
+- `knee` on an activation that does not use one, or a missing `knee` on
+  `smooth_l1`;
+- a non-positive `knee`;
 - unknown keys inside a term mapping.
 
 At task construction (`build_cost_terms`), where the model dimensions are
@@ -138,49 +186,43 @@ known:
 A term the yaml omits is absent from the compiled graph, not multiplied by
 zero inside it.
 
-## Activation
-
-`costs.activation` selects the activation for every term:
-
-- `quadratic` → `0.5 · Σ w_i r_i²`, crocoddyl's `ActivationModelWeightedQuad`,
-  constant Hessian. The default, and what the committed weights are tuned for.
-- `saturated` → `1 − exp(−Σ w_i r_i²)`, bounded to [0, 1). Available, but its
-  curvature vanishes as the error grows: measured at the state where the real
-  FR3 parked, `d²J/du²` was ~1e-4 **with three negative entries**, so the
-  optimizer could not see the control at all. Selecting it requires retuning
-  the weights and `solver.temperature` together.
-
-Note the weights sit inside the activation. For `quadratic` that is identical
-to a scalar weight outside it; for `saturated` it is not, and inside is the
-only position where a weight changes that term's influence at all.
-
 ## Reference configurations
 
-Today's committed controller — a joint-trajectory tracker, 1.6 mm terminal in
-sim:
+The controller that ran on hardware 2026-08-31 (7.27 mm settled, recovering
+from a 29 mm disturbance in 0.3 s):
 
 ```yaml
 running:
-  joint_position_plan: 10.0
-  joint_velocity_plan: 0.1
-  control_grav: 0.0001
-terminal:
-  joint_position_plan: 10.0
-  joint_velocity_plan: 0.1
+  joint_position: {weight: 1.0, reference: plan, activation: quadratic}
+  joint_velocity: {weight: 0.1, reference: plan, activation: quadratic}
+  control: {weight: 0.0001, reference: gravity, activation: quadratic}
+  ee_translation:
+    {weight: 1.4, reference: goal, activation: smooth_l1, knee: 0.001}
+  ee_rotation:
+    {weight: 0.3, reference: goal, activation: smooth_l1, knee: 0.01}
+terminal: (the same, without `control`)
+```
+
+The joint-trajectory tracker that still holds the best hardware number
+(4.30 mm settled, `pregrasp_real_20260811T085838Z_REFERENCE`):
+
+```yaml
+running:
+  joint_position: {weight: 10.0, reference: plan, activation: quadratic}
+  joint_velocity: {weight: 0.1, reference: plan, activation: quadratic}
+  control: {weight: 0.0001, reference: gravity, activation: quadratic}
+terminal: (the same, without `control`)
 ```
 
 Crocoddyl's canonical reach (`ocp_kuka_reaching.py`, weights 10 / 1e-1 / 1e-4)
-becomes expressible directly once `ee_translation` exists — note its state
-regularization references a *constant* `x₀`, not a trajectory:
+— note its state regularization references a *constant* `x₀`, not a trajectory:
 
 ```yaml
 running:
-  ee_translation: 10.0
-  joint_position: {weight: 0.1, reference: [...x0 q...]}
-  joint_velocity: {weight: 0.1, reference: [0, 0, 0, 0, 0, 0, 0]}
-  control_grav: 0.0001
-terminal:
-  ee_translation: 10.0
-  joint_position: {weight: 0.1, reference: [...x0 q...]}
-  joint_velocity: {weight: 0.1, reference: [0, 0, 0, 0, 0, 0, 0]}
+  ee_translation: {weight: 10.0, reference: goal, activation: quadratic}
+  joint_position:
+    {weight: 0.1, reference: [...x0 q...], activation: quadratic}
+  joint_velocity:
+    {weight: 0.1, reference: [0, 0, 0, 0, 0, 0, 0], activation: quadratic}
+  control: {weight: 0.0001, reference: gravity, activation: quadratic}
 ```

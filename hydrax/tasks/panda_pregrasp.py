@@ -8,12 +8,7 @@ import numpy as np
 from mujoco import mjx
 
 from hydrax import ROOT
-from hydrax.cost_residuals import (
-    ACTIVATIONS,
-    CostTerm,
-    build_cost_terms,
-    cost_sum,
-)
+from hydrax.cost_residuals import CostTerm, build_cost_terms, cost_sum
 from hydrax.task_base import Task
 
 # Friction feedforward, live only when with_frictionloss is False. The plant
@@ -48,28 +43,14 @@ class PandaPregraspOptions:
     # plan. The terminal drops the control term, as crocoddyl's terminal
     # CostModelSum does -- there is no control at that node to regularize.
     running_costs: Tuple[CostTerm, ...] = (
-        CostTerm("joint_position_plan", (10.0,)),
-        CostTerm("joint_velocity_plan", (0.1,)),
-        CostTerm("control_grav", (1e-4,)),
+        CostTerm("joint_position", (10.0,), "plan"),
+        CostTerm("joint_velocity", (0.1,), "plan"),
+        CostTerm("control", (1e-4,), "gravity"),
     )
     terminal_costs: Tuple[CostTerm, ...] = (
-        CostTerm("joint_position_plan", (10.0,)),
-        CostTerm("joint_velocity_plan", (0.1,)),
+        CostTerm("joint_position", (10.0,), "plan"),
+        CostTerm("joint_velocity", (0.1,), "plan"),
     )
-
-    # Which activation wraps each term's weighted squared residual, mirroring
-    # crocoddyl's pluggable ActivationModel (the residual, the weights and
-    # the activation are three separate choices there, so they are here too):
-    #
-    #   "quadratic" -> 0.5 * Σ w_i r_i²   — crocoddyl's
-    #                  ActivationModelWeightedQuad, constant Hessian, the
-    #                  default and what the weights above are tuned for.
-    #   "saturated" -> 1 - exp(-Σ w_i r_i²)  — bounds each term to [0, 1).
-    #                  Kept available, but note its curvature vanishes as the
-    #                  error grows, which is what made the OCP blind to the
-    #                  control (see cost_residuals.cost_sum). If you select
-    #                  it, retune the weights and solver.temperature with it.
-    cost_activation: str = "quadratic"
 
     # --- Task geometry ---
 
@@ -295,13 +276,6 @@ class PandaPregrasp(Task):
         )
         self.goal_pos = jnp.array(options.goal_pos, dtype=jnp.float32)
         self.goal_rot = jnp.array(options.goal_rot, dtype=jnp.float32)
-
-        if options.cost_activation not in ACTIVATIONS:
-            raise ValueError(
-                f"unknown cost_activation {options.cost_activation!r}; "
-                f"expected one of {sorted(ACTIVATIONS)}"
-            )
-        self.cost_activation = options.cost_activation
 
         # Resolve the yaml's term list against this model: lengths checked,
         # scalar weights broadcast, control terms rejected at the terminal.
@@ -565,9 +539,7 @@ class PandaPregrasp(Task):
         # 0.33-0.89 N.m breakaway friction — and the arm crept instead of
         # moving. The quadratic form measures 1.7-2.5x breakaway with zero
         # sign flips at that same state (2026-08-07).
-        return cost_sum(
-            self, self._running_terms, state, control, self.cost_activation
-        )
+        return cost_sum(self, self._running_terms, state, control)
 
     def terminal_cost(self, state: mjx.Data) -> jax.Array:
         """The terminal cost ϕ(x_T): the `costs.terminal` terms, NOT dt-scaled.
@@ -592,9 +564,7 @@ class PandaPregrasp(Task):
         construction, as crocoddyl's terminal CostModelSum drops its control
         regularization: there is no control at this node to regularize.
         """
-        return cost_sum(
-            self, self._terminal_terms, state, None, self.cost_activation
-        )
+        return cost_sum(self, self._terminal_terms, state, None)
 
     def domain_randomize_model(self, rng: jax.Array) -> Dict[str, jax.Array]:
         """Randomize physical modeling parameters.

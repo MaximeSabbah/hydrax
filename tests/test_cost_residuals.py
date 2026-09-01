@@ -80,14 +80,13 @@ def test_declared_dimension_is_the_real_one(name, task, state, control):
         if isinstance(spec.dim, int)
         else getattr(task.model, spec.dim)
     )
-    reference = jnp.zeros(dim) if spec.reference == "yaml" else None
-
-    residual = spec.fn(task, state, control, reference)
-
-    assert residual.shape == (dim,), (
-        f"'{name}' (r = {spec.formula}) declares dim {dim} but returned "
-        f"{residual.shape}"
-    )
+    for source, fn in spec.sources.items():
+        reference = jnp.zeros(dim) if source == "constant" else None
+        residual = fn(task, state, control, reference)
+        assert residual.shape == (dim,), (
+            f"'{name}' source '{source}' (r = {spec.formula}) declares dim "
+            f"{dim} but returned {residual.shape}"
+        )
 
 
 def test_cost_is_the_weighted_quadratic_the_doc_claims(task, state, control):
@@ -97,9 +96,10 @@ def test_cost_is_the_weighted_quadratic_the_doc_claims(task, state, control):
     terms, and the 0.5 of crocoddyl's ActivationModelWeightedQuad.
     """
     terms = (
-        CostTerm("joint_position_plan", (3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0)),
-        CostTerm("joint_velocity", (0.25,), reference=(0.0,) * task.model.nv),
-        CostTerm("control_grav", (7.0,)),
+        CostTerm("joint_position", (3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0), "plan"),
+        CostTerm("joint_velocity", (0.25,), "constant",
+                 reference=(0.0,) * task.model.nv),
+        CostTerm("control", (7.0,), "gravity"),
     )
     built = build_cost_terms(task, terms, "costs.running", allow_control=True)
 
@@ -112,7 +112,7 @@ def test_cost_is_the_weighted_quadratic_the_doc_claims(task, state, control):
         * jnp.sum(((control - state.qfrc_bias) / task.tau_max) ** 2)
     )
 
-    got = cost_sum(task, built, state, control, "quadratic")
+    got = cost_sum(task, built, state, control)
 
     assert float(got) == pytest.approx(float(expected), rel=1e-6)
 
@@ -121,21 +121,21 @@ def test_scalar_weight_matches_the_uniform_vector(task, state, control):
     """A scalar weight is exactly the uniform vector, not a rescaled one."""
     scalar = build_cost_terms(
         task,
-        (CostTerm("joint_position_plan", (10.0,)),),
+        (CostTerm("joint_position", (10.0,), "plan"),),
         "costs.running",
         allow_control=False,
     )
     vector = build_cost_terms(
         task,
-        (CostTerm("joint_position_plan", (10.0,) * task.model.nq),),
+        (CostTerm("joint_position", (10.0,) * task.model.nq, "plan"),),
         "costs.running",
         allow_control=False,
     )
 
     assert float(
-        cost_sum(task, scalar, state, control, "quadratic")
+        cost_sum(task, scalar, state, control)
     ) == pytest.approx(
-        float(cost_sum(task, vector, state, control, "quadratic")), rel=1e-6
+        float(cost_sum(task, vector, state, control)), rel=1e-6
     )
 
 
@@ -143,21 +143,21 @@ def test_scalar_weight_matches_the_uniform_vector(task, state, control):
     "block, because",
     [
         (
-            {"joint_postion_plan": 1.0},
+            {"joint_postion": 1.0},
             "a misspelled name is not silently dropped",
         ),
-        ({"joint_position": 1.0}, "a constant reference has no default"),
+        ({"joint_position": 1.0}, "an ambiguous reference must be stated"),
         (
-            {"joint_position_plan": {"weight": 1.0, "reference": [0.0] * 7}},
-            "a residual with a plan reference must not take a second one",
+            {"ee_translation": {"weight": 1.0, "reference": [0.0] * 3}},
+            "ee_translation takes no constant reference",
         ),
         (
-            {"control_grav": {"weight": 1e-4, "ref": [0.0] * 7}},
+            {"control": {"weight": 1e-4, "ref": [0.0] * 7}},
             "unknown sub-key",
         ),
-        ({"control_grav": {"reference": [0.0] * 7}}, "a term needs a weight"),
-        ({"control_grav": "cheap"}, "a weight must be numeric"),
-        ([("control_grav", 1e-4)], "a block is a mapping, not a list"),
+        ({"control": {"reference": [0.0] * 7}}, "a term needs a weight"),
+        ({"control": "cheap"}, "a weight must be numeric"),
+        ([("control", 1e-4)], "a block is a mapping, not a list"),
     ],
 )
 def test_load_rejects(block, because):
@@ -170,17 +170,17 @@ def test_load_rejects(block, because):
     "term, allow_control, because",
     [
         (
-            CostTerm("control_grav", (1e-4,)),
+            CostTerm("control", (1e-4,), "gravity"),
             False,
             "no control exists at the terminal node to regularize",
         ),
         (
-            CostTerm("joint_velocity_plan", (1.0, 2.0, 3.0)),
+            CostTerm("joint_velocity", (1.0, 2.0, 3.0), "plan"),
             True,
             "a weight vector must match the residual's length",
         ),
         (
-            CostTerm("joint_velocity", (0.1,), reference=(0.0, 0.0, 0.0)),
+            CostTerm("joint_velocity", (0.1,), "constant", reference=(0.0, 0.0, 0.0)),
             True,
             "a reference must match the residual's length",
         ),
@@ -258,7 +258,7 @@ def test_ee_translation_matches_forward_kinematics(task):
     )
     expected = reference.site_xpos[site] - goal_pos
 
-    got = RESIDUALS["ee_translation"].fn(task, state, None, None)
+    got = RESIDUALS["ee_translation"].sources["goal"](task, state, None, None)
     assert np.allclose(got, expected, atol=1e-6)
 
 
@@ -347,25 +347,25 @@ def test_ee_rotation_is_zero_at_the_goal_orientation(task):
         ),
     )
 
-    residual = RESIDUALS["ee_rotation"].fn(task, state, None, None)
+    residual = RESIDUALS["ee_rotation"].sources["goal"](task, state, None, None)
     assert np.allclose(residual, 0.0, atol=1e-5)
 
 
 def test_smooth_l1_gradient_stops_fading(task, state, control):
-    """The point of epsilon: the pull becomes constant instead of decaying.
+    """The point of the knee: the pull becomes constant instead of decaying.
 
     A quadratic cost's gradient is w·r, so it vanishes as the error shrinks and
     below some radius it can no longer command breakaway torque — measured on
     hardware as a stall at |tau - gravity|/breakaway = 0.62 on every run. The
     smooth-L1 gradient is w·r/√(r²+ε), which flattens to w above √ε.
     """
-    weight, epsilon = 10.0, 1e-6  # √ε = 1 mm
+    weight, knee = 10.0, 1e-3  # knee = 1 mm
 
     def quadratic(r):
         return 0.5 * weight * r**2
 
     def smooth_l1(r):
-        return weight * (jnp.sqrt(r**2 + epsilon) - jnp.sqrt(epsilon))
+        return weight * (jnp.sqrt(r**2 + knee**2) - knee)
 
     dq, ds = jax.grad(quadratic), jax.grad(smooth_l1)
 
@@ -378,26 +378,26 @@ def test_smooth_l1_gradient_stops_fading(task, state, control):
     assert float(ds(0.0001)) < 0.15 * weight
 
 
-def test_epsilon_term_matches_crocoddyl_smooth_1norm(task, state, control):
-    """cost_sum with epsilon == Σ_i w_i (√(r_i² + ε) − √ε), per component."""
-    epsilon = 1e-6
-    terms = (CostTerm("ee_translation", (10.0,), epsilon=epsilon),)
+def test_knee_term_matches_crocoddyl_smooth_1norm(task, state, control):
+    """smooth_l1 == Σ_i w_i (√(r_i² + knee²) − knee), per component."""
+    knee = 1e-3
+    terms = (CostTerm("ee_translation", (10.0,), "goal", activation="smooth_l1", knee=knee),)
     built = build_cost_terms(task, terms, "costs.running", allow_control=False)
 
-    residual = RESIDUALS["ee_translation"].fn(task, state, control, None)
+    residual = RESIDUALS["ee_translation"].sources["goal"](task, state, control, None)
     expected = jnp.sum(
-        10.0 * (jnp.sqrt(residual**2 + epsilon) - jnp.sqrt(epsilon))
+        10.0 * (jnp.sqrt(residual**2 + knee**2) - knee)
     )
 
-    got = cost_sum(task, built, state, control, "quadratic")
+    got = cost_sum(task, built, state, control)
     assert float(got) == pytest.approx(float(expected), rel=1e-6)
 
 
-def test_epsilon_must_be_positive():
-    """epsilon is a squared residual; zero or negative is meaningless."""
+def test_knee_must_be_positive():
+    """knee is a residual magnitude; zero or negative is meaningless."""
     with pytest.raises(ValueError):
         parse_cost_terms(
-            {"ee_translation": {"weight": 10.0, "epsilon": 0.0}},
+            {"ee_translation": {"weight": 10.0, "activation": "smooth_l1", "knee": 0.0}},
             "costs.running",
         )
 

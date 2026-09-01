@@ -1,29 +1,27 @@
 """The residuals a task's cost can be assembled from, selectable by name.
 
 The cost is crocoddyl's ``CostModelSum``: a sum of weighted, activated
-squared residuals,
-
-    J = Σ_terms  a( Σ_i w_i · r_i² )
-
-with one term per entry of the ``costs.running`` / ``costs.terminal`` blocks
-of the tuning yaml. Each entry names a residual from ``RESIDUALS`` below and
-gives its weight; that pairing is the whole controller definition, so a
+residuals, one per entry of the ``costs.running`` / ``costs.terminal`` blocks
+of the tuning yaml. That term list is the whole controller definition, so a
 different controller is a yaml edit rather than a code change.
 
-Two rules make an entry readable without opening this file:
+Three rules make an entry readable without opening this file:
 
-* **the name states where the reference comes from.** A ``_plan`` suffix
-  means the time-varying reference carried on ``mjx.Data.userdata``; the
-  unsuffixed name means a constant that the yaml must give explicitly. There
-  is no default reference — regularizing toward a value nobody chose is how
-  a cost silently stops meaning what its name says.
+* **the name says WHAT is measured, ``reference`` says AGAINST WHAT.** The two
+  are orthogonal: ``reference`` is either a source keyword (``plan``,
+  ``goal``, ``gravity``) or a constant vector written straight into the yaml.
+  It is always required — regularizing toward a value nobody chose is how a
+  cost silently stops meaning what its name says.
+* **the activation belongs to the term**, as it does in crocoddyl, where a
+  cost is ``CostModelResidual(state, activation, residual)``. There is no
+  global activation: reading one entry tells you that entry's shape.
 * **the weight may be a scalar or a per-component vector.** The vector form
   is crocoddyl's ``ActivationModelWeightedQuad`` (the weights live inside the
-  quadratic form), which is what lets a null-space joint be weighted down
-  without touching the rest of the term.
+  activation), which is what lets one joint be weighted differently from the
+  rest of the term.
 
-``doc/cost_residuals.md`` carries the same table for readers who are picking
-weights rather than editing code.
+``doc/cost_residuals.md`` carries the same tables for readers picking weights
+rather than editing code.
 """
 
 from dataclasses import dataclass
@@ -35,15 +33,52 @@ from mujoco import mjx
 
 from hydrax.task_base import Task
 
-# Activation applied to each term's weighted squared residual — crocoddyl's
-# pluggable ActivationModel, in the two forms this OCP has used. Selected once
-# for the whole cost by `costs.activation`.
-ACTIVATIONS = {
-    # ActivationModelWeightedQuad: a(r) = 0.5 rᵀ diag(w) r, constant Hessian
-    "quadratic": lambda weighted_square: 0.5 * weighted_square,
-    # Bounds each term to [0, 1); its curvature -> 0 as the error grows
-    "saturated": lambda weighted_square: 1.0 - jnp.exp(-weighted_square),
+
+def _quadratic(
+    weight: jax.Array, residual: jax.Array, knee: Optional[float]
+) -> jax.Array:
+    """0.5 Σ w_i r_i² — crocoddyl's ActivationModelWeightedQuad."""
+    return 0.5 * jnp.sum(weight * jnp.square(residual))
+
+
+def _saturated(
+    weight: jax.Array, residual: jax.Array, knee: Optional[float]
+) -> jax.Array:
+    """1 − exp(−Σ w_i r_i²), bounded to [0, 1).
+
+    Its curvature vanishes as the error grows, which is what once made this
+    OCP blind to the control: measured where the real FR3 parked, d²J/du² was
+    ~1e-4 with three NEGATIVE entries. Kept selectable, not recommended.
+    """
+    return 1.0 - jnp.exp(-jnp.sum(weight * jnp.square(residual)))
+
+
+def _smooth_l1(
+    weight: jax.Array, residual: jax.Array, knee: Optional[float]
+) -> jax.Array:
+    """Σ w_i (√(r_i² + knee²) − knee) — crocoddyl's ActivationModelSmooth1Norm.
+
+    Quadratic below ``knee``, linear above it, analytic everywhere (no branch).
+    The point is the gradient, ``w·r/√(r² + knee²)``: it tends to a CONSTANT w
+    above the knee instead of decaying to zero like the quadratic's ``w·r``. A
+    quadratic pull fades as the error shrinks, so below some radius it can no
+    longer command the breakaway torque and the joint stops — measured on
+    hardware at |tau − gravity| / breakaway = 0.62 on every run. A constant
+    pull has no such radius; what replaces it is ``knee``, which is chosen
+    rather than imposed by friction.
+    """
+    return jnp.sum(
+        weight * (jnp.sqrt(jnp.square(residual) + knee**2) - knee)
+    )
+
+
+# name -> (function, whether it requires a `knee`). Per TERM, not per problem.
+ACTIVATIONS: Dict[str, Tuple[Callable[..., jax.Array], bool]] = {
+    "quadratic": (_quadratic, False),
+    "saturated": (_saturated, False),
+    "smooth_l1": (_smooth_l1, True),
 }
+DEFAULT_ACTIVATION = "quadratic"
 
 
 @dataclass(frozen=True)
@@ -55,33 +90,33 @@ class ResidualSpec:
         dim: Length of r, as a model attribute name ("nq", "nv", "nu") or an
              explicit int. Resolved against the task's model at build time,
              and what a yaml weight/reference vector must match.
-        reference: Where the reference comes from — "yaml" (a constant the
-             yaml must supply), "plan" (time-varying, from userdata), "state"
-             (derived from the state itself) or "goal" (from userdata).
+        sources: Reference source keyword -> the function implementing it.
+             The yaml's ``reference`` picks one of these by name, or gives a
+             constant vector, which selects "constant". The NAME says what is
+             measured and ``reference`` says against what, so the two are
+             orthogonal and every term states both.
         uses_control: True if r depends on the control, which makes the term
              illegal in the terminal block: there is no control to regularize
              at the terminal node, and crocoddyl drops it there for the same
              reason.
-        fn: (task, state, control, reference) -> r.
     """
 
     formula: str
     dim: str | int
-    reference: str
+    sources: Dict[str, "Residual"]
     uses_control: bool
-    fn: "Residual"
 
 
 # Every residual takes the same arguments so the registry can call them
 # uniformly: the task (for its model constants and its plan), the state, the
 # control (None at the terminal node) and the constant reference from the yaml
-# (None when the residual has its own source). Each uses what it needs.
+# (None unless the source is "constant"). Each uses what it needs.
 Residual = Callable[
     [Task, mjx.Data, Optional[jax.Array], Optional[jax.Array]], jax.Array
 ]
 
 
-def _joint_position(
+def _joint_position_constant(
     task: Task,
     state: mjx.Data,
     control: Optional[jax.Array],
@@ -100,7 +135,7 @@ def _joint_position_plan(
     return state.qpos - q_ref
 
 
-def _joint_velocity(
+def _joint_velocity_constant(
     task: Task,
     state: mjx.Data,
     control: Optional[jax.Array],
@@ -119,7 +154,7 @@ def _joint_velocity_plan(
     return state.qvel - v_ref
 
 
-def _control(
+def _control_constant(
     task: Task,
     state: mjx.Data,
     control: Optional[jax.Array],
@@ -128,7 +163,7 @@ def _control(
     return (control - reference) / task.tau_max
 
 
-def _control_grav(
+def _control_gravity(
     task: Task,
     state: mjx.Data,
     control: Optional[jax.Array],
@@ -137,7 +172,7 @@ def _control_grav(
     return (control - state.qfrc_bias) / task.tau_max
 
 
-def _ee_translation(
+def _ee_translation_goal(
     task: Task,
     state: mjx.Data,
     control: Optional[jax.Array],
@@ -190,7 +225,7 @@ def so3_log(rotation: jax.Array) -> jax.Array:
     return theta * v / norm
 
 
-def _ee_rotation(
+def _ee_rotation_goal(
     task: Task,
     state: mjx.Data,
     control: Optional[jax.Array],
@@ -206,52 +241,36 @@ RESIDUALS: Dict[str, ResidualSpec] = {
     "joint_position": ResidualSpec(
         formula="q - q_ref",
         dim="nq",
-        reference="yaml",
+        sources={
+            "plan": _joint_position_plan,
+            "constant": _joint_position_constant,
+        },
         uses_control=False,
-        fn=_joint_position,
-    ),
-    "joint_position_plan": ResidualSpec(
-        formula="q - q_ref(t)",
-        dim="nq",
-        reference="plan",
-        uses_control=False,
-        fn=_joint_position_plan,
     ),
     "joint_velocity": ResidualSpec(
         formula="v - v_ref",
         dim="nv",
-        reference="yaml",
+        sources={
+            "plan": _joint_velocity_plan,
+            "constant": _joint_velocity_constant,
+        },
         uses_control=False,
-        fn=_joint_velocity,
     ),
-    "joint_velocity_plan": ResidualSpec(
-        formula="v - v_ref(t)",
-        dim="nv",
-        reference="plan",
-        uses_control=False,
-        fn=_joint_velocity_plan,
-    ),
-    # Both control residuals are divided by tau_max so the strong shoulder
-    # joints (87 N.m) and the wrist (12 N.m) compare — equivalently a weighted
-    # quadratic with w_i = 1/tau_max_i². A yaml `reference` is in N.m, before
-    # that scaling.
+    # Divided by tau_max so the strong shoulder joints (87 N.m) and the wrist
+    # (12 N.m) compare -- equivalently a weighted quadratic with
+    # w_i = 1/tau_max_i^2. A constant `reference` is in N.m, before that
+    # scaling. Source "gravity" is crocoddyl's ResidualModelControlGrav, up to
+    # one difference: qfrc_bias is MuJoCo's full bias force C(q,v)v + g(q),
+    # where crocoddyl uses computeGeneralizedGravity(q) alone. Measured along
+    # this task's plan the two differ by at most 0.048% of tau_max.
     "control": ResidualSpec(
         formula="(u - u_ref) / tau_max",
         dim="nu",
-        reference="yaml",
+        sources={
+            "gravity": _control_gravity,
+            "constant": _control_constant,
+        },
         uses_control=True,
-        fn=_control,
-    ),
-    # crocoddyl's ResidualModelControlGrav, up to one difference: qfrc_bias is
-    # MuJoCo's full bias force C(q,v)v + g(q), where crocoddyl uses
-    # computeGeneralizedGravity(q) alone. Measured along this task's plan the
-    # two differ by at most 0.048% of tau_max.
-    "control_grav": ResidualSpec(
-        formula="(u - qfrc_bias) / tau_max",
-        dim="nu",
-        reference="state",
-        uses_control=True,
-        fn=_control_grav,
     ),
     # crocoddyl's ResidualModelFrameTranslation on the gripper site. The goal
     # is read from userdata, not from a construction constant, so a goal that
@@ -265,9 +284,8 @@ RESIDUALS: Dict[str, ResidualSpec] = {
     "ee_translation": ResidualSpec(
         formula="p_gripper(q) - p_goal",
         dim=3,
-        reference="goal",
+        sources={"goal": _ee_translation_goal},
         uses_control=False,
-        fn=_ee_translation,
     ),
     # crocoddyl's ResidualModelFrameRotation. Together with ee_translation this
     # is ResidualModelFramePlacement, split so the two can be weighted apart --
@@ -280,9 +298,8 @@ RESIDUALS: Dict[str, ResidualSpec] = {
     "ee_rotation": ResidualSpec(
         formula="log3(R_goal^T R_gripper)",
         dim=3,
-        reference="goal",
+        sources={"goal": _ee_rotation_goal},
         uses_control=False,
-        fn=_ee_rotation,
     ),
 }
 
@@ -297,8 +314,10 @@ class CostTerm:
 
     name: str
     weight: Tuple[float, ...]
+    reference_source: str
     reference: Optional[Tuple[float, ...]] = None
-    epsilon: Optional[float] = None
+    activation: str = DEFAULT_ACTIVATION
+    knee: Optional[float] = None
 
 
 # What build_cost_terms hands to cost_sum: per term, the broadcast weight
@@ -306,7 +325,14 @@ class CostTerm:
 # residual itself. Resolved once at construction, so the compiled cost
 # contains exactly the terms the yaml asked for.
 BuiltTerms = Tuple[
-    Tuple[jax.Array, Optional[jax.Array], Optional[float], "Residual"], ...
+    Tuple[
+        jax.Array,
+        Optional[jax.Array],
+        Optional[float],
+        Callable[..., jax.Array],
+        "Residual",
+    ],
+    ...,
 ]
 
 
@@ -323,26 +349,36 @@ def _as_tuple(value: object, what: str, where: str) -> Tuple[float, ...]:
 def parse_cost_terms(block: object, label: str) -> Tuple[CostTerm, ...]:
     """Parse one ``costs.running`` / ``costs.terminal`` yaml block.
 
-    An entry is either the weight on its own::
+    Every entry is a mapping stating its weight, its reference and its
+    activation, so the file describes the OCP without anyone opening the code::
 
-        control_grav: 0.0001
-        joint_position_plan: [10, 10, 10, 10, 10, 10, 1.0]
+        joint_position: {weight: 1.0, reference: plan, activation: quadratic}
+        control: {weight: 1e-4, reference: gravity, activation: quadratic}
+        ee_translation:
+          weight: 1.4
+          reference: goal
+          activation: smooth_l1
+          knee: 0.001
 
-    or a mapping when a constant reference is needed::
+    ``reference`` is either a SOURCE KEYWORD from the residual's ``sources``
+    (``plan``, ``goal``, ``gravity``) or a CONSTANT VECTOR written inline::
 
         joint_position:
           weight: 1.0
           reference: [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
 
+    A bare number is still accepted as shorthand for weight-only, but then the
+    residual must have exactly one possible source, so nothing is ambiguous.
+
     Everything that could silently change what a term means is an error here:
-    an unknown name, a missing reference on a residual that has no other
-    source, and a reference on one that already has a source.
+    an unknown name, activation or source, a missing reference, a knee on an
+    activation that does not use one, or a missing knee on one that does.
     """
     if block is None:
         return ()
     if not isinstance(block, dict):
         raise ValueError(
-            f"'{label}' must be a mapping of residual name -> weight"
+            f"'{label}' must be a mapping of residual name -> entry"
         )
 
     terms = []
@@ -355,52 +391,86 @@ def parse_cost_terms(block: object, label: str) -> Tuple[CostTerm, ...]:
             )
         spec = RESIDUALS[name]
 
-        epsilon = None
+        knee = None
+        activation = DEFAULT_ACTIVATION
         if isinstance(entry, dict):
-            unknown = set(entry) - {"weight", "reference", "epsilon"}
+            unknown = set(entry) - {"weight", "reference", "activation", "knee"}
             if unknown:
                 raise ValueError(f"{where}: unknown keys {sorted(unknown)}")
             if "weight" not in entry:
                 raise ValueError(f"{where}: missing 'weight'")
             weight = _as_tuple(entry["weight"], "weight", where)
-            reference = entry.get("reference")
-            if "epsilon" in entry:
-                epsilon = float(entry["epsilon"])
-                if epsilon <= 0.0:
-                    raise ValueError(
-                        f"{where}: epsilon must be > 0 (it is the SQUARE of "
-                        f"the residual value where the cost turns quadratic)"
-                    )
+            raw_reference = entry.get("reference")
+            activation = str(entry.get("activation", DEFAULT_ACTIVATION))
+            if activation not in ACTIVATIONS:
+                raise ValueError(
+                    f"{where}: unknown activation {activation!r}; expected "
+                    f"one of {sorted(ACTIVATIONS)}"
+                )
+            if "knee" in entry:
+                knee = float(entry["knee"])
+                if knee <= 0.0:
+                    raise ValueError(f"{where}: knee must be > 0")
         else:
             weight = _as_tuple(entry, "weight", where)
-            reference = None
+            raw_reference = None
 
-        if spec.reference == "yaml":
-            if reference is None:
-                hint = (
-                    f" Use '{name}_plan' for the time-varying plan reference."
-                    if f"{name}_plan" in RESIDUALS
-                    else ""
-                )
-                raise ValueError(
-                    f"{where}: residual '{name}' (r = {spec.formula}) has no "
-                    f"reference of its own, so 'reference' is required.{hint}"
-                )
-            reference = _as_tuple(reference, "reference", where)  # noqa: PLW2901
-        elif reference is not None:
+        # knee and activation must agree: a knee no activation reads, or a
+        # shape whose transition point nobody chose, are both silent errors.
+        needs_knee = ACTIVATIONS[activation][1]
+        if needs_knee and knee is None:
             raise ValueError(
-                f"{where}: residual '{name}' takes its reference from "
-                f"'{spec.reference}', so 'reference' must not be set — two "
-                f"sources for one reference is how a cost stops meaning "
-                f"its name."
+                f"{where}: activation '{activation}' requires 'knee' -- the "
+                f"residual value below which it turns quadratic and settles. "
+                f"It is in the residual's own units (m, rad or N.m/tau_max), "
+                f"and it is a deliberate accuracy choice, so it has no default."
             )
+        if knee is not None and not needs_knee:
+            raise ValueError(
+                f"{where}: activation '{activation}' does not use 'knee'"
+            )
+
+        # The reference: a source keyword, an inline constant vector, or -- for
+        # a residual with only one possible source -- omitted.
+        named = sorted(k for k in spec.sources if k != "constant")
+        reference = None
+        if raw_reference is None:
+            if len(spec.sources) != 1:
+                raise ValueError(
+                    f"{where}: 'reference' is required; expected one of "
+                    f"{named} or a constant vector of length {spec.dim}"
+                )
+            source = next(iter(spec.sources))
+        elif isinstance(raw_reference, str):
+            source = raw_reference
+            if source not in spec.sources:
+                raise ValueError(
+                    f"{where}: unknown reference {source!r} for '{name}'; "
+                    f"expected one of {named}"
+                    + (" or a constant vector" if "constant" in spec.sources else "")
+                )
+            if source == "constant":
+                raise ValueError(
+                    f"{where}: reference 'constant' is selected by GIVING the "
+                    f"vector, e.g. reference: [0.0, ...]"
+                )
+        else:
+            if "constant" not in spec.sources:
+                raise ValueError(
+                    f"{where}: '{name}' takes no constant reference; expected "
+                    f"one of {named}"
+                )
+            source = "constant"
+            reference = _as_tuple(raw_reference, "reference", where)
 
         terms.append(
             CostTerm(
                 name=name,
                 weight=weight,
+                reference_source=source,
                 reference=reference,
-                epsilon=epsilon,
+                activation=activation,
+                knee=knee,
             )
         )
     return tuple(terms)
@@ -454,7 +524,9 @@ def build_cost_terms(
                 )
             reference = jnp.asarray(term.reference, dtype=jnp.float32)
 
-        built.append((weight, reference, term.epsilon, spec.fn))
+        activate, _ = ACTIVATIONS[term.activation]
+        residual_fn = spec.sources[term.reference_source]
+        built.append((weight, reference, term.knee, activate, residual_fn))
     return tuple(built)
 
 
@@ -463,38 +535,21 @@ def cost_sum(
     built: "BuiltTerms",
     state: mjx.Data,
     control: Optional[jax.Array],
-    activation: str,
 ) -> jax.Array:
-    """Sum the built terms, each either quadratic or smooth-L1.
+    """Σ over the built terms, each with its OWN activation.
 
-    A term with no ``epsilon`` uses the global activation on its weighted
-    squared residual, ``a(Σ_i w_i r_i²)``. The weights sit INSIDE the
-    activation, crocoddyl's ActivationModelWeightedQuad convention: for
-    "quadratic" that is identical to a scalar weight outside it; for
-    "saturated" it is not, since that form bounds each term to [0, 1)
+    Each term applies its activation to its own weighted residual, exactly as
+    crocoddyl's CostModelResidual pairs one activation with one residual.
+    There is no problem-wide activation to look up: the yaml entry states the
+    shape of that entry.
+
+    The weights sit INSIDE the activation (crocoddyl's WeightedQuad
+    convention). For "quadratic" that is identical to a scalar weight outside
+    it; for "saturated" it is not, since that form bounds each term to [0, 1)
     whatever its weight.
-
-    A term WITH ``epsilon`` uses crocoddyl's ActivationModelSmooth1Norm,
-    ``Σ_i w_i (√(r_i² + ε) − √ε)``, per component. The subtraction only makes
-    the term vanish at r = 0 so costs stay comparable; it changes no gradient.
-
-    The point of the smooth-L1 form is the gradient: ``w·r/√(r² + ε)``, which
-    tends to a CONSTANT w for |r| ≫ √ε instead of decaying to zero like the
-    quadratic's ``w·r``. A quadratic cost's pull fades as the error shrinks,
-    so below some radius it can no longer command the breakaway torque and the
-    joint stops -- measured on hardware at |tau - gravity| / breakaway = 0.62
-    on every run. A constant pull has no such radius; what replaces it is √ε,
-    which is chosen rather than imposed by friction.
     """
-    activate = ACTIVATIONS[activation]
     total = jnp.zeros(())
-    for weight, reference, epsilon, fn in built:
+    for weight, reference, knee, activate, fn in built:
         residual = fn(task, state, control, reference)
-        if epsilon is None:
-            total = total + activate(jnp.sum(weight * jnp.square(residual)))
-        else:
-            smooth_abs = jnp.sqrt(jnp.square(residual) + epsilon)
-            total = total + jnp.sum(
-                weight * (smooth_abs - jnp.sqrt(epsilon))
-            )
+        total = total + activate(weight, residual, knee)
     return total

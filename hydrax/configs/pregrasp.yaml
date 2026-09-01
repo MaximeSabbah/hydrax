@@ -1,55 +1,52 @@
 # Pregrasp OCP tuning 
 
-# The cost is crocoddyl's CostModelSum: one weighted residual per entry
-# below. THE TERM LIST IS THE CONTROLLER — swapping which residuals appear
-# here changes what is optimized, with no code change. Residual names, their
+# Residual names, their
 # formulas and the rules for `reference` are in doc/cost_residuals.md; an
 # unknown name is an error listing the available ones.
 #
-# An entry is either the weight on its own, or a mapping when the residual
-# needs a constant reference:
+# Every entry states its own weight, reference, and activation.
+# Omitting activation
+# means quadratic; it is written out here anyway so the file is self-contained.
 #
-#   control_grav: 0.0001
-#   joint_position_plan: [10, 10, 10, 10, 10, 10, 1.0]   # per-joint weights
-#   joint_position:
-#     weight: 1.0
-#     reference: [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
+# activation:
+#   quadratic -> 0.5 * sum_i w_i r_i^2                (WeightedQuad)
+#   smooth_l1 -> sum_i w_i (sqrt(r_i^2 + knee^2) - knee)  (Smooth1Norm)
+#                needs `knee`, in the RESIDUAL's own units (m, rad, or
+#                N.m/tau_max): below it the term is quadratic and the arm
+#                settles, above it the pull is a constant w. It is the
+#                accuracy you choose to stop at.
+#   saturated -> 1 - exp(-sum_i w_i r_i^2), bounded to [0,1); its curvature
+#                decays to zero, which once blinded the OCP to the control.
+#
+# `weight` may be a scalar or one value per residual component, e.g.
+#   joint_position_plan: {weight: [10,10,10,10,10,10,1.0], activation: quadratic}
 #
 # A `_plan` suffix means the reference is the time-varying quintic joint plan
-# carried on userdata; the unsuffixed name means a constant that must be given
-# explicitly here — there is no default reference.
+# carried on userdata; an unsuffixed name needs an explicit `reference` here.
+# Weights are ABSOLUTE, and their scale is what solver.temperature is matched
+# against — change one and check gain_ess (healthy 50-250).
 
 costs:
-  # Activation applied to each term's weighted squared residual (crocoddyl's
-  # ActivationModel):
-  #   quadratic -> 0.5 * sum_i w_i r_i^2, constant Hessian
-  #                (ActivationModelWeightedQuad)
-  #   saturated -> 1 - exp(-sum_i w_i r_i^2), bounded to [0,1) but its
-  #                curvature decays to zero, which blinds the OCP to the
-  #                control
-  # Weights are ABSOLUTE (not normalized against each other) and are tuned
-  # for `quadratic`; selecting `saturated` needs them and `temperature`
-  # retuned together.
-  activation: quadratic
-  # translation is metres, rotation radians: equal weights cost 1.59 -> 4.24 mm
-  # epsilon = the SQUARE of the residual where the cost turns quadratic and the
-  # pull fades. 1e-6 -> 1 mm, 1e-4 -> 0.01 rad.
   running:
-    joint_position_plan: 1.0
-    joint_velocity_plan: 0.1
-    control_grav: 0.0001
-    ee_translation: {weight: 1.4, epsilon: 1.0e-6}
-    ee_rotation: {weight: 0.3, epsilon: 1.0e-4}
+    joint_position: {weight: 1.0, reference: plan, activation: quadratic}
+    joint_velocity: {weight: 0.1, reference: plan, activation: quadratic}
+    control: {weight: 0.0001, reference: gravity, activation: quadratic}
+    ee_translation:
+      {weight: 1.4, reference: goal, activation: smooth_l1, knee: 0.001} # 1 mm
+    ee_rotation:
+      {weight: 0.3, reference: goal, activation: smooth_l1, knee: 0.01} # rad
   terminal:
-    joint_position_plan: 1.0
-    joint_velocity_plan: 0.1
-    ee_translation: {weight: 1.4, epsilon: 1.0e-6}
-    ee_rotation: {weight: 0.3, epsilon: 1.0e-4}
+    joint_position: {weight: 1.0, reference: plan, activation: quadratic}
+    joint_velocity: {weight: 0.1, reference: plan, activation: quadratic}
+    ee_translation:
+      {weight: 1.4, reference: goal, activation: smooth_l1, knee: 0.001} # 1 mm
+    ee_rotation:
+      {weight: 0.3, reference: goal, activation: smooth_l1, knee: 0.01} # rad
 
 solver:
   num_samples: 1024
   noise_scale: 0.03 # sampling std = noise_scale * tau_max, per joint
-  temperature: 0.012 # 0.007 for frictionloss to true
+  temperature: 0.01 # tunes the softmax and the Ricatti gains
   mean_adaptation_rate: 1.0 # <1 damps the hold jitter (partial mean update)
   num_knots: 4
   spline_type: linear # knot interpolation: zero, linear or cubic (gains need knot-linearity); linear measured calmer at the hold than cubic

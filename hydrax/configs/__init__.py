@@ -29,7 +29,6 @@ PICK_PLACE_CONFIG_YAML = ROOT + "/configs/pick_place.yaml"
 # keys in the yaml are an error.
 _PREGRASP_YAML_SCHEMA = {
     "costs": {
-        "activation": ("options", "cost_activation"),
         # Term lists, not scalars: parsed by cost_residuals.parse_cost_terms
         # rather than assigned straight through (see _PREGRASP_TERM_KEYS).
         "running": ("options", "running_costs"),
